@@ -1,0 +1,39 @@
+---
+- name: role to refresh package repos
+  hosts: all
+  tasks:
+  - name: yum/dnf style wipe
+    shell: rm -rf /etc/yum.repos.d/bitflux.repo
+    ignore_errors: true
+  - name: yum/dnf style deep cache clear
+    shell: find /var/cache | grep bitflux$ | sudo xargs rm -rf
+    ignore_errors: true
+  - name: Check if timeout is set to 5 in /etc/yum.conf as in amazonlinux2
+    shell: grep '^timeout=5$' /etc/yum.conf
+    register: grep_result
+    ignore_errors: true
+  - name: Ensure timeout is set to 60 if it was 5 in /etc/yum.conf for amazonlinux2 timeouts
+    lineinfile:
+      path: /etc/yum.conf
+      regexp: '^timeout='
+      line: 'timeout=60'
+    when: "'timeout=5' in grep_result.stdout_lines"
+  - name: dnf style clean all
+    shell: dnf clean all
+    ignore_errors: true
+  - name: yum style clean all
+    shell: yum clean all
+    ignore_errors: true
+  - name: apt style wipe
+    shell: rm -rf /etc/apt/sources.list.d/bitflux.sources
+    ignore_errors: true
+  - name: apt style clean all
+    shell: apt-get update
+    ignore_errors: true
+  - name: apt stop unattended upgrades
+    systemd:
+      name: unattended-upgrades
+      enabled: false
+    ignore_errors: true
+  - name: reboot
+    reboot:

@@ -1,0 +1,196 @@
+#!/bin/bash
+
+# Find the directory of the script and change to it
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+# Project root, adjust as needed
+PROJECT_DIR="$( cd $SCRIPT_DIR &> /dev/null && pwd )"
+cd "$SCRIPT_DIR"
+# Strip the script path to be relative to project root
+SCRIPT_PATH="${0#$PROJECT_DIR}"; [[ ! "$SCRIPT_PATH" =~ ^\..*$ ]] && SCRIPT_PATH=".$SCRIPT_PATH"
+
+
+
+############################################################################################
+SHORT_DESC="Building images for testing"
+############################################################################################
+
+# These lists will be parsed and used for the help output and validation
+VALID_COMMANDS=("distclean:Perform a deep clean of the code repos"
+                "clean:Clean the code repos"
+                "generate:Generate code from specs"
+                "build:Build the code"
+                "upload:Upload the docker image"
+                "clienttest:Run client test"
+                "install:Install the project to the instance"
+                "help:Show help for TARGET")
+VALID_FLAGS=("--help|-h:Show help for this script"
+               "--debug:Enable debug mode"
+               "--dryrun:Dryrun.  Don't actually run the commands"
+               "--verbose:Verbose output")
+FLAGS_EXPANSIONS=("--debug:--debug --verbose")
+COMMAND_EXPANSIONS=("distclean:distclean clean"
+                    "init:generate init")
+
+FLAGS=("--verbose")
+COMMANDS=()
+# Parse command line arguments
+#cli_parser $@
+
+if [ "$1" == "build" ]; then
+  COMMANDS+=("clean" "generate" "start" "upgrade" "stop")
+else
+  COMMANDS+=($1)
+fi
+
+
+# find an flag in a list of valid flags
+parse_flags() {
+  local i=$1
+  for flag in "${FLAGS[@]}"; do
+    if [ "$flag" == "$i" ]; then
+      echo "$1"
+      break
+    fi
+  done
+}
+
+
+# Allows --dryrun to not actually run the commands
+# also allows --verbose to show the commands being run
+run_command() {
+  local command="$1"
+  if [ ! -z "$(parse_flags '--dryrun')" ] || [ ! -z "$(parse_flags '--verbose')" ]; then
+    local LPWD=$(pwd)
+    local PWD="${LPWD#$PROJECT_DIR}"
+    if [ ! -z "$(parse_flags '--dryrun')" ]; then
+      echo "    Would have run '$command' from '$PWD'"
+    else
+      echo "    Running '$command' from '$PWD'"
+    fi
+  fi
+  if [ -z "$(parse_flags '--dryrun')" ]; then
+    eval "$command"
+  fi
+}
+
+
+function hash_password() {
+  local password="$1"
+  salt=$(openssl rand -base64 16)
+  hashed_password=$(openssl passwd -6 -salt "$salt" "$password")
+  echo "$hashed_password"
+}
+
+function run_ansible() {
+  local inventoryfile=""
+  local playbookfile=""
+  local ansibleparams=""
+  while [[ $# -gt 0 ]]; do
+    if [ -z "$inventoryfile" ]; then
+      inventoryfile="$1"
+    elif [ -z "$playbookfile" ]; then
+      playbookfile="$1"
+    else
+      ansibleparams="$ansibleparams $1"
+    fi
+    shift
+  done
+  local CMD=""
+  #CMD+="source ${PROJECT_DIR}/.venv/bin/activate; "
+  CMD+="ANSIBLE_HOST_KEY_CHECKING=False "
+  CMD+="ansible-playbook "
+  CMD+="$LOCALCONNECTION "
+  CMD+="--inventory $inventoryfile $playbookfile $ansibleparams"
+  run_command "$CMD"
+}
+
+
+PACKER_BASEDIR="$SCRIPT_DIR"
+PACKER_OUTPUT="$PACKER_BASEDIR/output"
+PACKER_IMAGE_DEFS="$PACKER_BASEDIR/qemu_images"
+ANSIBLE_DIR="$( cd ${SCRIPT_DIR}/../ansible &> /dev/null && pwd )"
+
+export PKR_VAR_distro="ubuntu2404"
+
+export PKR_VAR_username="packer"
+export PKR_VAR_password="packer"
+export PKR_VAR_output_directory="$PACKER_OUTPUT/${PKR_VAR_distro}"
+export PKR_VAR_hashedpassword="$(hash_password $PKR_VAR_password)"
+
+
+echo "PACKER_BASEDIR: $PACKER_BASEDIR"
+echo "PACKER_OUTPUT: $PACKER_OUTPUT"
+echo "PACKER_IMAGE_DEFS: $PACKER_IMAGE_DEFS"
+
+
+echo "  ##################################################################"
+echo "  # Running '$SCRIPT_PATH' script"
+echo "  #   Commands: ${COMMANDS[@]}"
+echo "  #   Flags: ${FLAGS[@]}"
+echo "  #   Options: ${OPTIONS[@]}"
+echo "  #-----------------------------------------------------------------"
+
+# Execute the command
+for COMMAND in "${COMMANDS[@]}"; do
+  case "$COMMAND" in
+    distclean)
+      echo "  Distcleaning..."
+      run_command "rm -rf ${PACKER_OUTPUT}"
+      ;;
+    clean)
+      echo "  Cleaning..."
+      run_command "rm -rf ${PKR_VAR_output_directory}"
+      ;;
+    generate)
+      echo "  Generate..."
+      run_command "rm -rf ${PACKER_OUTPUT}"
+      # Uses PKR_VAR_* variables...
+      cd ${PACKER_IMAGE_DEFS}/${PKR_VAR_distro}/http
+      run_command "envsubst < user-data.tpl > user-data"
+      cd ${PACKER_IMAGE_DEFS}/${PKR_VAR_distro}
+      run_command "packer init ."
+      run_command "packer build ."
+      run_command "sudo cp ${PKR_VAR_output_directory}/${PKR_VAR_distro} /var/lib/libvirt/images/${PKR_VAR_distro}.qcow2"
+      #run_command "sudo rm -rf ${PKR_VAR_output_directory}"
+      ;;
+    start)
+      echo "  Starting VM..."
+      cd ${ANSIBLE_DIR}
+      ANSIBLE_PARAMS="--extra-vars vmdisk_path=\"/var/lib/libvirt/images/${PKR_VAR_distro}.qcow2\""
+      ANSIBLE_PARAMS+=" --extra-vars machine_name=packerbuild"
+      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_username=${PKR_VAR_username}"
+      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_password=${PKR_VAR_password}"
+      run_ansible localhost.yml vm_start.yml $ANSIBLE_PARAMS
+      cd ${SCRIPT_DIR}
+      ;;
+    stop)
+      echo "  Stopping VM..."
+      cd ${ANSIBLE_DIR}
+      ANSIBLE_PARAMS="--extra-vars vmdisk_path=\"/var/lib/libvirt/images/${PKR_VAR_distro}.qcow2\""
+      ANSIBLE_PARAMS+=" --extra-vars machine_name=packerbuild"
+      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_username=${PKR_VAR_username}"
+      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_password=${PKR_VAR_password}"
+      run_ansible localhost.yml vm_stop.yml $ANSIBLE_PARAMS
+      cd ${SCRIPT_DIR}
+      ;;
+    upgrade)
+      cd ${ANSIBLE_DIR}
+      ANSIBLE_PARAMS="--extra-vars vmdisk_path=\"/var/lib/libvirt/images/${PKR_VAR_distro}.qcow2\""
+      run_ansible inventory.yml vm_upgrade.yml $ANSIBLE_PARAMS
+      cd ${SCRIPT_DIR}
+      ;;
+    upload)
+      echo "  Upload image..."
+      echo "UNIMPLEMENTED"
+      ;;
+    *)
+      echo "command '$COMMAND' not implemented"
+      show_usage
+      exit 1
+      ;;
+  esac
+done
+
+echo "  #-----------------------------------------------------------------"
+echo "  # '$SCRIPT_PATH' script DONE"
+echo "  ##################################################################"

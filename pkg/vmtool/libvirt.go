@@ -3,6 +3,8 @@ package vmtool
 import (
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,13 +16,19 @@ type Manager struct {
 	conn *libvirt.Connect
 }
 
-// NewManager opens a connection to the local libvirt daemon.
+// NewManager opens a connection to the local libvirt daemon and ensures
+// the default NAT network exists and is active.
 func NewManager() (*Manager, error) {
 	conn, err := libvirt.NewConnect("qemu:///system")
 	if err != nil {
 		return nil, fmt.Errorf("connecting to libvirt: %w", err)
 	}
-	return &Manager{conn: conn}, nil
+	mgr := &Manager{conn: conn}
+	if err := mgr.EnsureDefaultNetwork(); err != nil {
+		mgr.Close()
+		return nil, fmt.Errorf("ensuring default network: %w", err)
+	}
+	return mgr, nil
 }
 
 // Close releases the libvirt connection.
@@ -30,16 +38,13 @@ func (m *Manager) Close() error {
 }
 
 // domainXML builds a full libvirt domain XML from a VMConfig.
-// Uses machine type "pc" (i440fx) to match packer's QEMU builder default,
-// ensuring the guest NIC gets the same PCI address / interface name as
-// during the packer build.
 func domainXML(cfg VMConfig) string {
 	return fmt.Sprintf(`<domain type='kvm'>
   <name>%s</name>
   <memory unit='MiB'>%d</memory>
   <vcpu>%d</vcpu>
   <os>
-    <type arch='x86_64' machine='pc'>hvm</type>
+    <type arch='x86_64' machine='q35'>hvm</type>
     <boot dev='hd'/>
   </os>
   <features>
@@ -67,6 +72,9 @@ func domainXML(cfg VMConfig) string {
     <video>
       <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>
     </video>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
     <memballoon model='virtio'/>
     <rng model='virtio'>
       <backend model='random'>/dev/urandom</backend>
@@ -128,15 +136,91 @@ func (m *Manager) Undefine(name string) error {
 	return dom.Undefine()
 }
 
-// Create defines and starts a VM in one step.
+// CloneImage creates a new volume in the default pool by cloning a base image.
+// Returns the path to the new volume.
+func (m *Manager) CloneImage(baseImage, newName string) (string, error) {
+	pool, err := m.conn.LookupStoragePoolByName("default")
+	if err != nil {
+		return "", fmt.Errorf("looking up default pool: %w", err)
+	}
+	defer pool.Free()
+
+	srcVol, err := pool.LookupStorageVolByName(baseImage)
+	if err != nil {
+		return "", fmt.Errorf("looking up base image %q: %w", baseImage, err)
+	}
+	defer srcVol.Free()
+
+	srcInfo, err := srcVol.GetInfo()
+	if err != nil {
+		return "", fmt.Errorf("getting base image info: %w", err)
+	}
+
+	volName := newName + ".qcow2"
+	volXML := fmt.Sprintf(`<volume>
+  <name>%s</name>
+  <capacity>%d</capacity>
+  <target>
+    <format type='qcow2'/>
+  </target>
+</volume>`, volName, srcInfo.Capacity)
+
+	newVol, err := pool.StorageVolCreateXMLFrom(volXML, srcVol, 0)
+	if err != nil {
+		return "", fmt.Errorf("cloning volume: %w", err)
+	}
+	defer newVol.Free()
+
+	path, err := newVol.GetPath()
+	if err != nil {
+		return "", fmt.Errorf("getting new volume path: %w", err)
+	}
+	return path, nil
+}
+
+// Create clones the base image, optionally resizes it, defines, and starts a VM.
+// cfg.DiskPath should be the path to the base image (from ImagePath).
+// It will be replaced with the path to the cloned volume.
 func (m *Manager) Create(cfg VMConfig) error {
+	clonedPath, err := m.CloneImage(
+		filepath.Base(cfg.DiskPath),
+		cfg.Name,
+	)
+	if err != nil {
+		return fmt.Errorf("cloning image: %w", err)
+	}
+	cfg.DiskPath = clonedPath
+
+	if cfg.DiskSizeGB > 0 {
+		if err := m.ResizeVolume(cfg.Name+".qcow2", uint64(cfg.DiskSizeGB)*1024*1024*1024); err != nil {
+			return fmt.Errorf("resizing disk: %w", err)
+		}
+	}
+
 	if err := m.Define(cfg); err != nil {
 		return err
 	}
 	return m.Start(cfg.Name)
 }
 
-// Delete stops (force) and undefines a VM.
+// ResizeVolume resizes a volume in the default pool to the given size in bytes.
+func (m *Manager) ResizeVolume(volName string, sizeBytes uint64) error {
+	pool, err := m.conn.LookupStoragePoolByName("default")
+	if err != nil {
+		return fmt.Errorf("looking up default pool: %w", err)
+	}
+	defer pool.Free()
+
+	vol, err := pool.LookupStorageVolByName(volName)
+	if err != nil {
+		return fmt.Errorf("looking up volume %q: %w", volName, err)
+	}
+	defer vol.Free()
+
+	return vol.Resize(sizeBytes, 0)
+}
+
+// Delete stops (force), undefines a VM, and removes its cloned disk volume.
 func (m *Manager) Delete(name string) error {
 	dom, err := m.conn.LookupDomainByName(name)
 	if err != nil {
@@ -153,7 +237,29 @@ func (m *Manager) Delete(name string) error {
 			return fmt.Errorf("destroying domain: %w", err)
 		}
 	}
-	return dom.Undefine()
+
+	if err := dom.Undefine(); err != nil {
+		return fmt.Errorf("undefining domain: %w", err)
+	}
+
+	// Clean up the cloned volume
+	volName := name + ".qcow2"
+	pool, err := m.conn.LookupStoragePoolByName("default")
+	if err != nil {
+		return nil // VM removed, pool lookup is best-effort
+	}
+	defer pool.Free()
+
+	vol, err := pool.LookupStorageVolByName(volName)
+	if err != nil {
+		return nil // no matching volume, nothing to clean up
+	}
+	defer vol.Free()
+
+	if err := vol.Delete(0); err != nil {
+		return fmt.Errorf("deleting volume %q: %w", volName, err)
+	}
+	return nil
 }
 
 func domainState(state libvirt.DomainState) VMState {
@@ -243,16 +349,28 @@ func (m *Manager) List() ([]VMInfo, error) {
 	return vms, nil
 }
 
-// getIP attempts to retrieve the IP address from a running domain's DHCP leases.
+// getIP attempts to retrieve the IP address from a running domain.
+// It tries DHCP leases first (works for libvirt-managed networks), then
+// falls back to ARP (works for bridge/direct-attached interfaces).
 func (m *Manager) getIP(dom *libvirt.Domain) (string, error) {
-	ifaces, err := dom.ListAllInterfaceAddresses(libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE)
-	if err != nil {
-		return "", err
+	sources := []libvirt.DomainInterfaceAddressesSource{
+		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_ARP,
 	}
-	for _, iface := range ifaces {
-		for _, addr := range iface.Addrs {
-			if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
-				return addr.Addr, nil
+	for _, src := range sources {
+		ifaces, err := dom.ListAllInterfaceAddresses(src)
+		if err != nil {
+			continue
+		}
+		for _, iface := range ifaces {
+			if iface.Name == "lo" {
+				continue
+			}
+			for _, addr := range iface.Addrs {
+				if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 && !net.ParseIP(addr.Addr).IsLoopback() {
+					return addr.Addr, nil
+				}
 			}
 		}
 	}
@@ -276,6 +394,79 @@ func (m *Manager) WaitForIP(name string, timeout time.Duration) (string, error) 
 		time.Sleep(time.Second)
 	}
 	return "", fmt.Errorf("timed out waiting for IP on %q", name)
+}
+
+// EnsureDefaultNetwork creates and starts the default NAT network if it doesn't exist.
+func (m *Manager) EnsureDefaultNetwork() error {
+	net, err := m.conn.LookupNetworkByName("default")
+	if err == nil {
+		// Network exists, make sure it's active
+		active, err := net.IsActive()
+		if err != nil {
+			net.Free()
+			return fmt.Errorf("checking network status: %w", err)
+		}
+		if !active {
+			if err := net.Create(); err != nil {
+				net.Free()
+				return fmt.Errorf("starting default network: %w", err)
+			}
+		}
+		net.Free()
+		return nil
+	}
+
+	// Create the default network
+	netXML := `<network>
+  <name>default</name>
+  <forward mode='nat'>
+    <nat>
+      <port start='1024' end='65535'/>
+    </nat>
+  </forward>
+  <bridge name='virbr0' stp='on' delay='0'/>
+  <ip address='192.168.122.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.122.2' end='192.168.122.254'/>
+    </dhcp>
+  </ip>
+</network>`
+
+	net, err = m.conn.NetworkDefineXML(netXML)
+	if err != nil {
+		return fmt.Errorf("defining default network: %w", err)
+	}
+	defer net.Free()
+
+	if err := net.SetAutostart(true); err != nil {
+		return fmt.Errorf("setting network autostart: %w", err)
+	}
+	if err := net.Create(); err != nil {
+		return fmt.Errorf("starting default network: %w", err)
+	}
+	return nil
+}
+
+// ListBridges returns host bridge interfaces, excluding libvirt-managed ones (virbr*).
+func (m *Manager) ListBridges() ([]string, error) {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil, fmt.Errorf("reading /sys/class/net: %w", err)
+	}
+	var bridges []string
+	for _, e := range entries {
+		name := e.Name()
+		// A directory with a "bridge" subdirectory is a bridge device
+		if _, err := os.Stat(filepath.Join("/sys/class/net", name, "bridge")); err != nil {
+			continue
+		}
+		// Skip libvirt-managed bridges — those should be used via NAT mode
+		if strings.HasPrefix(name, "virbr") {
+			continue
+		}
+		bridges = append(bridges, name)
+	}
+	return bridges, nil
 }
 
 // ListNetworks returns the names of available libvirt networks.

@@ -11,7 +11,7 @@ SCRIPT_PATH="${0#$PROJECT_DIR}"; [[ ! "$SCRIPT_PATH" =~ ^\..*$ ]] && SCRIPT_PATH
 
 
 ############################################################################################
-SHORT_DESC="Building images for testing"
+SHORT_DESC="Building images"
 ############################################################################################
 
 # These lists will be parsed and used for the help output and validation
@@ -33,14 +33,7 @@ COMMAND_EXPANSIONS=("distclean:distclean clean"
 
 FLAGS=("--verbose")
 COMMANDS=()
-# Parse command line arguments
-#cli_parser $@
-
-if [ "$1" == "build" ]; then
-  COMMANDS+=("clean" "generate" "start" "upgrade" "stop")
-else
-  COMMANDS+=($1)
-fi
+COMMANDS+=($1)
 
 
 # find an flag in a list of valid flags
@@ -80,30 +73,6 @@ function hash_password() {
   hashed_password=$(openssl passwd -6 -salt "$salt" "$password")
   echo "$hashed_password"
 }
-
-function run_ansible() {
-  local inventoryfile=""
-  local playbookfile=""
-  local ansibleparams=""
-  while [[ $# -gt 0 ]]; do
-    if [ -z "$inventoryfile" ]; then
-      inventoryfile="$1"
-    elif [ -z "$playbookfile" ]; then
-      playbookfile="$1"
-    else
-      ansibleparams="$ansibleparams $1"
-    fi
-    shift
-  done
-  local CMD=""
-  #CMD+="source ${PROJECT_DIR}/.venv/bin/activate; "
-  CMD+="ANSIBLE_HOST_KEY_CHECKING=False "
-  CMD+="ansible-playbook "
-  CMD+="$LOCALCONNECTION "
-  CMD+="--inventory $inventoryfile $playbookfile $ansibleparams"
-  run_command "$CMD"
-}
-
 
 PACKER_BASEDIR="$SCRIPT_DIR"
 PACKER_OUTPUT="$PACKER_BASEDIR/output"
@@ -151,37 +120,7 @@ for COMMAND in "${COMMANDS[@]}"; do
       run_command "packer init ."
       run_command "packer build ."
       run_command "sudo cp ${PKR_VAR_output_directory}/${PKR_VAR_distro} /var/lib/libvirt/images/${PKR_VAR_distro}.qcow2"
-      #run_command "sudo rm -rf ${PKR_VAR_output_directory}"
-      ;;
-    start)
-      echo "  Starting VM..."
-      cd ${ANSIBLE_DIR}
-      ANSIBLE_PARAMS="--extra-vars vmdisk_path=\"/var/lib/libvirt/images/${PKR_VAR_distro}.qcow2\""
-      ANSIBLE_PARAMS+=" --extra-vars machine_name=packerbuild"
-      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_username=${PKR_VAR_username}"
-      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_password=${PKR_VAR_password}"
-      run_ansible localhost.yml vm_start.yml $ANSIBLE_PARAMS
-      cd ${SCRIPT_DIR}
-      ;;
-    stop)
-      echo "  Stopping VM..."
-      cd ${ANSIBLE_DIR}
-      ANSIBLE_PARAMS="--extra-vars vmdisk_path=\"/var/lib/libvirt/images/${PKR_VAR_distro}.qcow2\""
-      ANSIBLE_PARAMS+=" --extra-vars machine_name=packerbuild"
-      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_username=${PKR_VAR_username}"
-      ANSIBLE_PARAMS+=" --extra-vars  PKR_VAR_password=${PKR_VAR_password}"
-      run_ansible localhost.yml vm_stop.yml $ANSIBLE_PARAMS
-      cd ${SCRIPT_DIR}
-      ;;
-    upgrade)
-      cd ${ANSIBLE_DIR}
-      ANSIBLE_PARAMS="--extra-vars vmdisk_path=\"/var/lib/libvirt/images/${PKR_VAR_distro}.qcow2\""
-      run_ansible inventory.yml vm_upgrade.yml $ANSIBLE_PARAMS
-      cd ${SCRIPT_DIR}
-      ;;
-    upload)
-      echo "  Upload image..."
-      echo "UNIMPLEMENTED"
+      run_command "virsh pool-refresh default"
       ;;
     *)
       echo "command '$COMMAND' not implemented"

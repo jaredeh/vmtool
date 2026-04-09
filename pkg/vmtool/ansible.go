@@ -24,16 +24,42 @@ func ListPlaybooks(dir string) ([]string, error) {
 }
 
 // RunPlaybook executes an ansible-playbook against the given inventory file.
-func RunPlaybook(inventoryPath, playbookPath string) error {
+// Returns the combined stdout/stderr output and any error.
+func RunPlaybook(inventoryPath, playbookPath string) (string, error) {
 	cmd := exec.Command("ansible-playbook",
 		"--inventory", inventoryPath,
 		playbookPath,
 	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "ANSIBLE_HOST_KEY_CHECKING=False")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("running playbook %s: %w", filepath.Base(playbookPath), err)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("running playbook %s: %w", filepath.Base(playbookPath), err)
+	}
+	return string(out), nil
+}
+
+// RunCommand runs an ad-hoc ansible command on all hosts in the inventory.
+// Returns the combined output and any error.
+func RunCommand(inventoryPath, command string) (string, error) {
+	cmd := exec.Command("ansible", "all",
+		"--inventory", inventoryPath,
+		"--become",
+		"--module-name", "shell",
+		"--args", command,
+	)
+	cmd.Env = append(os.Environ(), "ANSIBLE_HOST_KEY_CHECKING=False")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("running command: %w", err)
+	}
+	return string(out), nil
+}
+
+// GrowDisk expands the root partition and filesystem to fill the disk.
+// Assumes standard Ubuntu direct layout: vda1=ESP, vda2=root.
+func GrowDisk(inventoryPath string) error {
+	if _, err := RunCommand(inventoryPath, "growpart /dev/vda 2 && resize2fs /dev/vda2"); err != nil {
+		return fmt.Errorf("growing disk: %w", err)
 	}
 	return nil
 }

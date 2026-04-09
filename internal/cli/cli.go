@@ -46,14 +46,15 @@ func withManager(fn func(m *vmtool.Manager, cmd *cobra.Command, args []string) e
 
 func createCmd() *cobra.Command {
 	var (
-		vcpus     uint
-		memoryMiB uint
-		netType   string
-		netSource string
-		sshUser   string
-		sshPass   string
-		inventory string
-		playbook  string
+		vcpus      uint
+		memoryMiB  uint
+		diskSizeGB uint
+		netType    string
+		netSource  string
+		sshUser    string
+		sshPass    string
+		inventory  string
+		playbook   string
 	)
 
 	cmd := &cobra.Command{
@@ -73,6 +74,9 @@ func createCmd() *cobra.Command {
 			if memoryMiB > 0 {
 				cfg.MemoryMiB = memoryMiB
 			}
+			if diskSizeGB > 0 {
+				cfg.DiskSizeGB = diskSizeGB
+			}
 			if netType != "" {
 				cfg.Network.Type = vmtool.NetworkType(netType)
 			}
@@ -89,7 +93,7 @@ func createCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("VM %q created and started\n", name)
-			ip, err := m.WaitForIP(name, 30*1e9) // 30s
+			ip, err := m.WaitForIP(name, 120*1e9) // 120s
 			if err == nil {
 				fmt.Printf("IP: %s\n", ip)
 				if inventory != "" {
@@ -99,11 +103,19 @@ func createCmd() *cobra.Command {
 					fmt.Printf("Inventory written to %s\n", inventory)
 				}
 			}
+			if cfg.DiskSizeGB > 0 && ip != "" {
+				if err := vmtool.GrowDisk(inventory); err != nil {
+					return fmt.Errorf("growing disk: %w", err)
+				}
+				fmt.Println("Disk partition and filesystem expanded")
+			}
 			if playbook != "" {
 				if ip == "" {
 					return fmt.Errorf("cannot run playbook: VM has no IP")
 				}
-				if err := vmtool.RunPlaybook(inventory, playbook); err != nil {
+				output, err := vmtool.RunPlaybook(inventory, playbook)
+				fmt.Print(output)
+				if err != nil {
 					return fmt.Errorf("running playbook: %w", err)
 				}
 				fmt.Printf("Playbook %s completed\n", playbook)
@@ -118,6 +130,7 @@ func createCmd() *cobra.Command {
 
 	cmd.Flags().UintVar(&vcpus, "vcpus", 0, "number of virtual CPUs (default 2)")
 	cmd.Flags().UintVar(&memoryMiB, "memory", 0, "memory in MiB (default 2048)")
+	cmd.Flags().UintVar(&diskSizeGB, "disk-size", 0, "disk size in GB (default: same as base image)")
 	cmd.Flags().StringVar(&netType, "net-type", "", "network type: nat, bridge, direct")
 	cmd.Flags().StringVar(&netSource, "net-source", "", "network source (network name, bridge, or host interface)")
 	cmd.Flags().StringVar(&sshUser, "ssh-user", "", "SSH username (default packer)")
@@ -295,7 +308,9 @@ func playbookCmd() *cobra.Command {
 				fmt.Printf("Inventory %s updated with IP %s\n", inventory, info.IP)
 			}
 
-			if err := vmtool.RunPlaybook(inventory, playbookPath); err != nil {
+			output, err := vmtool.RunPlaybook(inventory, playbookPath)
+			fmt.Print(output)
+			if err != nil {
 				return fmt.Errorf("running playbook: %w", err)
 			}
 			fmt.Printf("Playbook %s completed\n", playbookPath)

@@ -7,10 +7,12 @@ import (
 )
 
 // WriteInventory writes or overwrites an Ansible inventory file with the
-// given VM's IP and SSH credentials.
+// given VM's IP and SSH credentials. If the parent directory does not exist,
+// the write is silently skipped.
 func WriteInventory(path, ip, sshUser, sshPass string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("creating inventory directory: %w", err)
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
 	}
 	content := fmt.Sprintf(`all:
   hosts:

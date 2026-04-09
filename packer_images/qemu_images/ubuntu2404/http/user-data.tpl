@@ -8,8 +8,16 @@ autoinstall:
   ssh:
     install-server: true
     allow-pw: true
-    # authorized-keys:
-    #   - ssh-ed25519 AAAA....
+  # network:
+  #   network:
+  #     version: 2
+  #     ethernets:
+  #       all-en:
+  #         match:
+  #           name: en*
+  #         dhcp4: true
+  packages:
+    - qemu-guest-agent
   storage:
     layout:
       name: direct

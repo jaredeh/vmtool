@@ -11,10 +11,14 @@ func networkXML(cfg NetworkConfig) string {
       <model type="virtio"/>
     </interface>`, cfg.Source)
 	case NetworkDirect:
+		mode := cfg.MacvtapMode
+		if mode == "" {
+			mode = MacvtapBridge
+		}
 		return fmt.Sprintf(`    <interface type="direct">
-      <source dev="%s" mode="vepa"/>
+      <source dev="%s" mode="%s"/>
       <model type="virtio"/>
-    </interface>`, cfg.Source)
+    </interface>`, cfg.Source, mode)
 	default: // NetworkNAT
 		src := cfg.Source
 		if src == "" {

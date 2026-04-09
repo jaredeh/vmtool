@@ -12,21 +12,33 @@ const (
 	NetworkDirect NetworkType = "direct"
 )
 
+// MacvtapMode defines the macvtap operating mode for direct-attached interfaces.
+type MacvtapMode string
+
+const (
+	MacvtapBridge      MacvtapMode = "bridge"
+	MacvtapVEPA        MacvtapMode = "vepa"
+	MacvtapPrivate     MacvtapMode = "private"
+	MacvtapPassthrough MacvtapMode = "passthrough"
+)
+
 // NetworkConfig describes the VM's network attachment.
 type NetworkConfig struct {
-	Type   NetworkType
-	Source string // network name (nat), bridge name (bridge), or host interface (direct)
+	Type        NetworkType
+	Source      string      // network name (nat), bridge name (bridge), or host interface (direct)
+	MacvtapMode MacvtapMode // only used for NetworkDirect
 }
 
 // VMConfig holds the parameters for defining a VM.
 type VMConfig struct {
-	Name      string
-	VCPUs     uint
-	MemoryMiB uint
-	DiskPath  string
-	Network   NetworkConfig
-	SSHUser   string
-	SSHPass   string
+	Name       string
+	VCPUs      uint
+	MemoryMiB  uint
+	DiskPath   string
+	DiskSizeGB uint // 0 means use the base image size as-is
+	Network    NetworkConfig
+	SSHUser    string
+	SSHPass    string
 }
 
 // DefaultConfig returns a VMConfig with sensible defaults.

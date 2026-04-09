@@ -17,6 +17,9 @@ source "qemu" "ubuntu" {
   memory           = 4096
   cpus             = 4
   accelerator      = "kvm"
+  machine_type     = "q35"
+  net_device       = "virtio-net-pci"
+  disk_interface   = "virtio"
   headless         = true
   boot_wait        = "3s"
   boot_command = [
@@ -26,7 +29,7 @@ source "qemu" "ubuntu" {
     "<f10>"
   ]
   http_directory   = "http"
-  shutdown_command = "echo 'var.username' | sudo -S shutdown -P now"
+  shutdown_command = "echo '${var.password}' | sudo -S shutdown -P now"
   ssh_username     = var.username
   ssh_password     = var.password
   ssh_timeout      = "60m"
@@ -34,6 +37,19 @@ source "qemu" "ubuntu" {
 
 build {
   sources = ["source.qemu.ubuntu"]
+
+  provisioner "file" {
+    source      = "files/99-wildcard.yaml"
+    destination = "/tmp/99-wildcard.yaml"
+  }
+
+  provisioner "shell" {
+    inline = [
+      "sudo rm -f /etc/netplan/50-cloud-init.yaml",
+      "sudo cp /tmp/99-wildcard.yaml /etc/netplan/99-wildcard.yaml",
+      "sudo chmod 600 /etc/netplan/99-wildcard.yaml",
+    ]
+  }
 }
 
 variable "output_directory" {
@@ -47,11 +63,11 @@ variable "distro" {
 }
 
 variable "username" {
-  description = "Initial username for the."
+  description = "Initial username for the VM."
   type        = string
 }
 
 variable "password" {
-  description = "The directory where the output files will be stored."
+  description = "Password for the initial user."
   type        = string
 }

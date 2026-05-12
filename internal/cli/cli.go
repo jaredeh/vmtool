@@ -24,6 +24,7 @@ func Execute() error {
 		deleteCmd(),
 		listCmd(),
 		infoCmd(),
+		autostartCmd(),
 		interactiveCmd(),
 		networksCmd(),
 		playbookCmd(),
@@ -212,13 +213,17 @@ func listCmd() *cobra.Command {
 				return err
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tSTATE\tVCPUS\tMEMORY\tIP")
+			fmt.Fprintln(w, "NAME\tSTATE\tVCPUS\tMEMORY\tAUTOSTART\tIP")
 			for _, vm := range vms {
 				ip := vm.IP
 				if ip == "" {
 					ip = "-"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%d\t%d MiB\t%s\n", vm.Name, vm.State, vm.VCPUs, vm.MemoryMiB, ip)
+				autostart := "off"
+				if vm.Autostart {
+					autostart = "on"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%d\t%d MiB\t%s\t%s\n", vm.Name, vm.State, vm.VCPUs, vm.MemoryMiB, autostart, ip)
 			}
 			return w.Flush()
 		}),
@@ -239,11 +244,45 @@ func infoCmd() *cobra.Command {
 			if ip == "" {
 				ip = "-"
 			}
-			fmt.Printf("Name:   %s\n", info.Name)
-			fmt.Printf("State:  %s\n", info.State)
-			fmt.Printf("VCPUs:  %d\n", info.VCPUs)
-			fmt.Printf("Memory: %d MiB\n", info.MemoryMiB)
-			fmt.Printf("IP:     %s\n", ip)
+			autostart := "off"
+			if info.Autostart {
+				autostart = "on"
+			}
+			fmt.Printf("Name:      %s\n", info.Name)
+			fmt.Printf("State:     %s\n", info.State)
+			fmt.Printf("VCPUs:     %d\n", info.VCPUs)
+			fmt.Printf("Memory:    %d MiB\n", info.MemoryMiB)
+			fmt.Printf("Autostart: %s\n", autostart)
+			fmt.Printf("IP:        %s\n", ip)
+			return nil
+		}),
+	}
+}
+
+func autostartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "autostart <name> <on|off>",
+		Short: "Enable or disable autostart for a VM",
+		Args:  cobra.ExactArgs(2),
+		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
+			name := args[0]
+			var enable bool
+			switch args[1] {
+			case "on", "true", "yes", "1":
+				enable = true
+			case "off", "false", "no", "0":
+				enable = false
+			default:
+				return fmt.Errorf("invalid value %q: use on or off", args[1])
+			}
+			if err := m.SetAutostart(name, enable); err != nil {
+				return err
+			}
+			label := "disabled"
+			if enable {
+				label = "enabled"
+			}
+			fmt.Printf("Autostart %s for VM %q\n", label, name)
 			return nil
 		}),
 	}

@@ -1,0 +1,81 @@
+---
+- name: Prepare Ubuntu VM for UniFi OS Server
+  hosts: all
+  become: yes
+
+  tasks:
+    - name: Update apt cache and upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+
+    - name: Install UniFi OS Server prerequisites
+      apt:
+        name:
+          - podman
+          - slirp4netns
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+
+    - name: Verify podman version
+      command: podman --version
+      register: podman_version
+      changed_when: false
+      check_mode: no
+
+    - name: Assert podman version is sufficient
+      assert:
+        that:
+          - "'4.' in podman_version.stdout or '5.' in podman_version.stdout"
+        fail_msg: "Podman version is too old. UniFi OS requires 4.3.1+."
+
+    - name: Create persistent data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - "{{ unifi_data_dir }}/data"
+        - "{{ unifi_data_dir }}/log"
+
+    - name: Pull UniFi container image
+      containers.podman.podman_image:
+        name: "{{ unifi_image }}"
+
+    - name: Create UniFi OS container
+      containers.podman.podman_container:
+        name: unifi-os
+        image: "{{ unifi_image }}"
+        state: created
+        restart_policy: always
+        network_mode: host
+        volume:
+          - "{{ unifi_data_dir }}/data:/unifi/data:Z"
+          - "{{ unifi_data_dir }}/log:/unifi/log:Z"
+        env:
+          TZ: "America/Los_Angeles"
+          # Memory limits are often necessary for Java-based UniFi
+          JVM_MAX_HEAP_SIZE: "1024M"
+          JVM_INIT_HEAP_SIZE: "512M"
+
+    - name: Generate systemd service for UniFi container
+      command:
+        cmd: "podman generate systemd --name unifi-os --files --dest /etc/systemd/system/"
+      args:
+        creates: /etc/systemd/system/container-unifi-os.service
+
+    - name: Enable and start UniFi service
+      systemd:
+        name: container-unifi-os
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Output Connection Info
+      debug:
+        msg: "UniFi OS is starting. Access it at https://{{ ansible_host }}:8443"

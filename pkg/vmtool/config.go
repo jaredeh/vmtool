@@ -76,4 +76,5 @@ type VMInfo struct {
 	VCPUs     uint
 	MemoryMiB uint
 	IP        string
+	Autostart bool
 }

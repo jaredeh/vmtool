@@ -387,6 +387,24 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = modeConfirm
 			}
 		}
+	case "a":
+		if m.focus == paneVMs && len(m.vms) > 0 {
+			vm := m.vms[m.cursor]
+			newState := !vm.Autostart
+			err := m.manager.SetAutostart(vm.Name, newState)
+			if err != nil {
+				idx := m.addLog(fmt.Sprintf("autostart %s: error: %v", vm.Name, err))
+				m.log[idx].status = logStatusError
+			} else {
+				label := "enabled"
+				if !newState {
+					label = "disabled"
+				}
+				idx := m.addLog(fmt.Sprintf("autostart %s for %s", label, vm.Name))
+				m.log[idx].status = logStatusDone
+			}
+			return m, refresh(m.manager)
+		}
 	case "D":
 		if m.focus == paneVMs && len(m.vms) > 0 {
 			vm := m.vms[m.cursor]
@@ -1171,7 +1189,7 @@ func (m model) View() string {
 	} else if len(m.vms) == 0 {
 		b.WriteString("  No VMs found.\n")
 	} else {
-		header := fmt.Sprintf("  %-20s %-10s %-6s %-10s %s", "NAME", "STATE", "VCPUS", "MEMORY", "IP")
+		header := fmt.Sprintf("  %-20s %-10s %-6s %-10s %-11s %s", "NAME", "STATE", "VCPUS", "MEMORY", "AUTOSTART", "IP")
 		b.WriteString(statusStyle.Render(header))
 		b.WriteString("\n")
 
@@ -1180,8 +1198,12 @@ func (m model) View() string {
 			if ip == "" {
 				ip = "-"
 			}
-			line := fmt.Sprintf("  %-20s %-10s %-6d %-10s %s",
-				vm.Name, vm.State, vm.VCPUs, fmt.Sprintf("%d MiB", vm.MemoryMiB), ip)
+			autostart := "off"
+			if vm.Autostart {
+				autostart = "on"
+			}
+			line := fmt.Sprintf("  %-20s %-10s %-6d %-10s %-11s %s",
+				vm.Name, vm.State, vm.VCPUs, fmt.Sprintf("%d MiB", vm.MemoryMiB), autostart, ip)
 
 			if i == m.cursor && vmFocus {
 				b.WriteString(selectedStyle.Render("> " + line[2:]))
@@ -1259,7 +1281,7 @@ func (m model) View() string {
 
 	b.WriteString("\n")
 	if m.focus == paneVMs {
-		b.WriteString(helpStyle.Render("c=create  s=start/stop  p=playbook  D=delete  r=refresh  tab=log  q=quit"))
+		b.WriteString(helpStyle.Render("c=create  s=start/stop  a=autostart  p=playbook  D=delete  r=refresh  tab=log  q=quit"))
 	} else {
 		b.WriteString(helpStyle.Render("enter=view output  tab=vms  q=quit"))
 	}

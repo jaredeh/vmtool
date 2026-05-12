@@ -295,11 +295,14 @@ func (m *Manager) Info(name string) (*VMInfo, error) {
 		return nil, fmt.Errorf("getting state: %w", err)
 	}
 
+	autostart, _ := dom.GetAutostart()
+
 	vi := &VMInfo{
 		Name:      name,
 		State:     domainState(state),
 		VCPUs:     uint(info.NrVirtCpu),
 		MemoryMiB: uint(info.MaxMem / 1024),
+		Autostart: autostart,
 	}
 
 	if state == libvirt.DOMAIN_RUNNING {
@@ -334,11 +337,13 @@ func (m *Manager) List() ([]VMInfo, error) {
 			continue
 		}
 
+		autostart, _ := dom.GetAutostart()
 		vi := VMInfo{
 			Name:      name,
 			State:     domainState(state),
 			VCPUs:     uint(info.NrVirtCpu),
 			MemoryMiB: uint(info.MaxMem / 1024),
+			Autostart: autostart,
 		}
 		if state == libvirt.DOMAIN_RUNNING {
 			vi.IP, _ = m.getIP(&dom)
@@ -484,6 +489,26 @@ func (m *Manager) ListNetworks() ([]string, error) {
 		n.Free()
 	}
 	return names, nil
+}
+
+// GetAutostart returns whether the VM is set to start automatically on host boot.
+func (m *Manager) GetAutostart(name string) (bool, error) {
+	dom, err := m.conn.LookupDomainByName(name)
+	if err != nil {
+		return false, fmt.Errorf("looking up domain %q: %w", name, err)
+	}
+	defer dom.Free()
+	return dom.GetAutostart()
+}
+
+// SetAutostart enables or disables automatic start of the VM on host boot.
+func (m *Manager) SetAutostart(name string, autostart bool) error {
+	dom, err := m.conn.LookupDomainByName(name)
+	if err != nil {
+		return fmt.Errorf("looking up domain %q: %w", name, err)
+	}
+	defer dom.Free()
+	return dom.SetAutostart(autostart)
 }
 
 // Reboot requests a reboot of the VM.

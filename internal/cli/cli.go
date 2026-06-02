@@ -20,6 +20,7 @@ func Execute() error {
 		createCmd(),
 		startCmd(),
 		stopCmd(),
+		resumeCmd(),
 		destroyCmd(),
 		deleteCmd(),
 		listCmd(),
@@ -167,6 +168,21 @@ func startCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("VM %q started\n", args[0])
+			return nil
+		}),
+	}
+}
+
+func resumeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume <name>",
+		Short: "Resume a paused VM",
+		Args:  cobra.ExactArgs(1),
+		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
+			if err := m.Resume(args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("VM %q resumed\n", args[0])
 			return nil
 		}),
 	}

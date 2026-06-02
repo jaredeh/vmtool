@@ -107,13 +107,33 @@ func (m *Manager) Start(name string) error {
 }
 
 // Stop requests a graceful ACPI shutdown of the VM.
+// If the VM is paused, it is resumed first so ACPI shutdown can reach it.
 func (m *Manager) Stop(name string) error {
 	dom, err := m.conn.LookupDomainByName(name)
 	if err != nil {
 		return fmt.Errorf("looking up domain %q: %w", name, err)
 	}
 	defer dom.Free()
+	state, _, err := dom.GetState()
+	if err != nil {
+		return fmt.Errorf("getting state: %w", err)
+	}
+	if state == libvirt.DOMAIN_PAUSED {
+		if err := dom.Resume(); err != nil {
+			return fmt.Errorf("resuming paused domain: %w", err)
+		}
+	}
 	return dom.Shutdown()
+}
+
+// Resume unpauses a paused VM.
+func (m *Manager) Resume(name string) error {
+	dom, err := m.conn.LookupDomainByName(name)
+	if err != nil {
+		return fmt.Errorf("looking up domain %q: %w", name, err)
+	}
+	defer dom.Free()
+	return dom.Resume()
 }
 
 // Destroy forces an immediate power-off of the VM.

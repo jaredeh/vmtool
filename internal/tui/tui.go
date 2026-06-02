@@ -684,8 +684,7 @@ func (m model) submitCreate() (tea.Model, tea.Cmd) {
 
 func stageClone(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg {
 	name := ctx.cfg.Name
-	image := filepath.Base(ctx.cfg.DiskPath)
-	clonedPath, err := mgr.CloneImage(image, name)
+	clonedPath, err := mgr.CloneImage(ctx.cfg.DiskPath, name, ctx.cfg.Pool)
 	if err != nil {
 		return createStageMsg{
 			doneIdx: logIdx,
@@ -697,7 +696,7 @@ func stageClone(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg {
 
 	msg := createStageMsg{
 		doneIdx: logIdx,
-		title:   fmt.Sprintf("%s: cloned %s → %s.qcow2", name, image, name),
+		title:   fmt.Sprintf("%s: cloned → %s.qcow2", name, name),
 		status:  logStatusDone,
 	}
 
@@ -714,7 +713,7 @@ func stageClone(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg {
 func stageResize(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg {
 	name := ctx.cfg.Name
 	sizeBytes := uint64(ctx.cfg.DiskSizeGB) * 1024 * 1024 * 1024
-	err := mgr.ResizeVolume(name+".qcow2", sizeBytes)
+	err := mgr.ResizeVolume(ctx.cfg.DiskPath, sizeBytes)
 
 	if err != nil {
 		return createStageMsg{

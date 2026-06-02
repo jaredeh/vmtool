@@ -36,6 +36,7 @@ type VMConfig struct {
 	MemoryMiB  uint
 	DiskPath   string
 	DiskSizeGB uint // 0 means use the base image size as-is
+	Pool       string
 	Network    NetworkConfig
 	SSHUser    string
 	SSHPass    string
@@ -49,6 +50,7 @@ func DefaultConfig(name, diskPath string) VMConfig {
 		VCPUs:     2,
 		MemoryMiB: 2048,
 		DiskPath:  diskPath,
+		Pool:      "default",
 		Network: NetworkConfig{
 			Type:   NetworkNAT,
 			Source: "default",

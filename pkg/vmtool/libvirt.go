@@ -136,18 +136,11 @@ func (m *Manager) Undefine(name string) error {
 	return dom.Undefine()
 }
 
-// CloneImage creates a new volume in the default pool by cloning a base image.
-// Returns the path to the new volume.
-func (m *Manager) CloneImage(baseImage, newName string) (string, error) {
-	pool, err := m.conn.LookupStoragePoolByName("default")
+// CloneImage clones basePath into targetPool under newName.qcow2 and returns the new volume path.
+func (m *Manager) CloneImage(basePath, newName, targetPool string) (string, error) {
+	srcVol, err := m.conn.LookupStorageVolByPath(basePath)
 	if err != nil {
-		return "", fmt.Errorf("looking up default pool: %w", err)
-	}
-	defer pool.Free()
-
-	srcVol, err := pool.LookupStorageVolByName(baseImage)
-	if err != nil {
-		return "", fmt.Errorf("looking up base image %q: %w", baseImage, err)
+		return "", fmt.Errorf("looking up base image at %q: %w", basePath, err)
 	}
 	defer srcVol.Free()
 
@@ -155,6 +148,12 @@ func (m *Manager) CloneImage(baseImage, newName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("getting base image info: %w", err)
 	}
+
+	pool, err := m.conn.LookupStoragePoolByName(targetPool)
+	if err != nil {
+		return "", fmt.Errorf("looking up pool %q: %w", targetPool, err)
+	}
+	defer pool.Free()
 
 	volName := newName + ".qcow2"
 	volXML := fmt.Sprintf(`<volume>
@@ -183,10 +182,7 @@ func (m *Manager) CloneImage(baseImage, newName string) (string, error) {
 // It will be replaced with the path to the cloned volume.
 func (m *Manager) Create(cfg VMConfig) error {
 	if !cfg.Noclone {
-		clonedPath, err := m.CloneImage(
-			filepath.Base(cfg.DiskPath),
-			cfg.Name,
-		)
+		clonedPath, err := m.CloneImage(cfg.DiskPath, cfg.Name, cfg.Pool)
 		if err != nil {
 			return fmt.Errorf("cloning image: %w", err)
 		}
@@ -194,7 +190,7 @@ func (m *Manager) Create(cfg VMConfig) error {
 	}
 
 	if cfg.DiskSizeGB > 0 {
-		if err := m.ResizeVolume(cfg.Name+".qcow2", uint64(cfg.DiskSizeGB)*1024*1024*1024); err != nil {
+		if err := m.ResizeVolume(cfg.DiskPath, uint64(cfg.DiskSizeGB)*1024*1024*1024); err != nil {
 			return fmt.Errorf("resizing disk: %w", err)
 		}
 	}
@@ -205,20 +201,13 @@ func (m *Manager) Create(cfg VMConfig) error {
 	return m.Start(cfg.Name)
 }
 
-// ResizeVolume resizes a volume in the default pool to the given size in bytes.
-func (m *Manager) ResizeVolume(volName string, sizeBytes uint64) error {
-	pool, err := m.conn.LookupStoragePoolByName("default")
+// ResizeVolume resizes a volume (by path) to the given size in bytes.
+func (m *Manager) ResizeVolume(volPath string, sizeBytes uint64) error {
+	vol, err := m.conn.LookupStorageVolByPath(volPath)
 	if err != nil {
-		return fmt.Errorf("looking up default pool: %w", err)
-	}
-	defer pool.Free()
-
-	vol, err := pool.LookupStorageVolByName(volName)
-	if err != nil {
-		return fmt.Errorf("looking up volume %q: %w", volName, err)
+		return fmt.Errorf("looking up volume at %q: %w", volPath, err)
 	}
 	defer vol.Free()
-
 	return vol.Resize(sizeBytes, 0)
 }
 
@@ -229,6 +218,13 @@ func (m *Manager) Delete(name string, noclone bool) error {
 		return fmt.Errorf("looking up domain %q: %w", name, err)
 	}
 	defer dom.Free()
+
+	var diskPath string
+	if !noclone {
+		if xmlDesc, err := dom.GetXMLDesc(0); err == nil {
+			diskPath = parseDiskSourcePath(xmlDesc)
+		}
+	}
 
 	state, _, err := dom.GetState()
 	if err != nil {
@@ -244,27 +240,18 @@ func (m *Manager) Delete(name string, noclone bool) error {
 		return fmt.Errorf("undefining domain: %w", err)
 	}
 
-	// If noclone we don't want to clean up the disk
-	if noclone {
+	if noclone || diskPath == "" {
 		return nil
 	}
 
-	// Clean up the cloned volume
-	volName := name + ".qcow2"
-	pool, err := m.conn.LookupStoragePoolByName("default")
-	if err != nil {
-		return nil // VM removed, pool lookup is best-effort
-	}
-	defer pool.Free()
-
-	vol, err := pool.LookupStorageVolByName(volName)
+	vol, err := m.conn.LookupStorageVolByPath(diskPath)
 	if err != nil {
 		return nil // no matching volume, nothing to clean up
 	}
 	defer vol.Free()
 
 	if err := vol.Delete(0); err != nil {
-		return fmt.Errorf("deleting volume %q: %w", volName, err)
+		return fmt.Errorf("deleting volume at %q: %w", diskPath, err)
 	}
 	return nil
 }
@@ -528,6 +515,35 @@ func (m *Manager) Reboot(name string) error {
 	return dom.Reboot(0)
 }
 
+// parsePoolPath extracts the <path> value from a storage pool XML descriptor.
+func parsePoolPath(xml string) string {
+	si := strings.Index(xml, "<path>")
+	if si == -1 {
+		return ""
+	}
+	si += len("<path>")
+	ei := strings.Index(xml[si:], "</path>")
+	if ei == -1 {
+		return ""
+	}
+	return xml[si : si+ei]
+}
+
+// parseDiskSourcePath extracts the disk source file path from a domain XML descriptor.
+func parseDiskSourcePath(xml string) string {
+	const marker = "<source file='"
+	si := strings.Index(xml, marker)
+	if si == -1 {
+		return ""
+	}
+	si += len(marker)
+	ei := strings.Index(xml[si:], "'")
+	if ei == -1 {
+		return ""
+	}
+	return xml[si : si+ei]
+}
+
 // DefaultPoolPath returns the filesystem path of the "default" storage pool.
 func (m *Manager) DefaultPoolPath() (string, error) {
 	pool, err := m.conn.LookupStoragePoolByName("default")
@@ -541,69 +557,207 @@ func (m *Manager) DefaultPoolPath() (string, error) {
 		return "", fmt.Errorf("getting pool XML: %w", err)
 	}
 
-	// Parse <target><path>/var/lib/libvirt/images</path></target>
-	start := strings.Index(xml, "<target>")
-	if start == -1 {
-		return "", fmt.Errorf("no <target> in pool XML")
+	path := parsePoolPath(xml)
+	if path == "" {
+		return "", fmt.Errorf("could not parse path from pool XML")
 	}
-	pathStart := strings.Index(xml[start:], "<path>")
-	if pathStart == -1 {
-		return "", fmt.Errorf("no <path> in pool XML")
-	}
-	pathStart += start + len("<path>")
-	pathEnd := strings.Index(xml[pathStart:], "</path>")
-	if pathEnd == -1 {
-		return "", fmt.Errorf("no </path> in pool XML")
-	}
-	return xml[pathStart : pathStart+pathEnd], nil
+	return path, nil
 }
 
-// ListImages returns the names of .qcow2 volumes in the default storage pool
-// using the libvirt storage pool API (no direct filesystem access needed).
+// ListImages returns the names of .qcow2 volumes across all storage pools.
 func (m *Manager) ListImages() ([]string, error) {
-	pool, err := m.conn.LookupStoragePoolByName("default")
+	pools, err := m.conn.ListAllStoragePools(0)
 	if err != nil {
-		return nil, fmt.Errorf("looking up default pool: %w", err)
+		return nil, fmt.Errorf("listing storage pools: %w", err)
 	}
-	defer pool.Free()
-
-	vols, err := pool.ListAllStorageVolumes(0)
-	if err != nil {
-		return nil, fmt.Errorf("listing pool volumes: %w", err)
-	}
-
 	var images []string
-	for _, vol := range vols {
-		name, err := vol.GetName()
-		vol.Free()
+	for _, pool := range pools {
+		vols, err := pool.ListAllStorageVolumes(0)
 		if err != nil {
+			pool.Free()
 			continue
 		}
-		if strings.HasSuffix(name, ".qcow2") {
-			images = append(images, name)
+		for _, vol := range vols {
+			name, err := vol.GetName()
+			vol.Free()
+			if err != nil {
+				continue
+			}
+			if strings.HasSuffix(name, ".qcow2") {
+				images = append(images, name)
+			}
 		}
+		pool.Free()
 	}
 	return images, nil
 }
 
-// ImagePath returns the full filesystem path for a volume in the default pool
-// using the libvirt storage volume API.
+// ImagePath searches all storage pools for a volume by name and returns its path.
 func (m *Manager) ImagePath(name string) (string, error) {
-	pool, err := m.conn.LookupStoragePoolByName("default")
+	pools, err := m.conn.ListAllStoragePools(0)
 	if err != nil {
-		return "", fmt.Errorf("looking up default pool: %w", err)
+		return "", fmt.Errorf("listing storage pools: %w", err)
+	}
+	for _, pool := range pools {
+		vol, err := pool.LookupStorageVolByName(name)
+		if err != nil {
+			pool.Free()
+			continue
+		}
+		path, pathErr := vol.GetPath()
+		vol.Free()
+		pool.Free()
+		if pathErr != nil {
+			return "", fmt.Errorf("getting volume path: %w", pathErr)
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("image %q not found in any storage pool", name)
+}
+
+// PoolInfo holds metadata about a storage pool.
+type PoolInfo struct {
+	Name   string
+	Path   string
+	Active bool
+}
+
+// ListPools returns metadata for all storage pools.
+func (m *Manager) ListPools() ([]PoolInfo, error) {
+	pools, err := m.conn.ListAllStoragePools(0)
+	if err != nil {
+		return nil, fmt.Errorf("listing storage pools: %w", err)
+	}
+	var result []PoolInfo
+	for _, pool := range pools {
+		name, _ := pool.GetName()
+		active, _ := pool.IsActive()
+		path := ""
+		if xmlDesc, err := pool.GetXMLDesc(0); err == nil {
+			path = parsePoolPath(xmlDesc)
+		}
+		result = append(result, PoolInfo{Name: name, Path: path, Active: active})
+		pool.Free()
+	}
+	return result, nil
+}
+
+// CreatePool defines a new directory-type storage pool at path, starts it, and sets autostart.
+func (m *Manager) CreatePool(name, path string) error {
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return fmt.Errorf("creating pool directory: %w", err)
+	}
+	poolXML := fmt.Sprintf(`<pool type='dir'>
+  <name>%s</name>
+  <target>
+    <path>%s</path>
+  </target>
+</pool>`, name, path)
+
+	pool, err := m.conn.StoragePoolDefineXML(poolXML, 0)
+	if err != nil {
+		return fmt.Errorf("defining pool: %w", err)
 	}
 	defer pool.Free()
 
-	vol, err := pool.LookupStorageVolByName(name)
-	if err != nil {
-		return "", fmt.Errorf("looking up volume %q: %w", name, err)
+	if err := pool.Create(0); err != nil {
+		return fmt.Errorf("starting pool: %w", err)
 	}
-	defer vol.Free()
+	if err := pool.SetAutostart(true); err != nil {
+		return fmt.Errorf("setting pool autostart: %w", err)
+	}
+	return nil
+}
 
-	path, err := vol.GetPath()
+// MigrateDisk copies a VM's disk to targetPool, redefines the domain with the new path,
+// and restarts the VM if it was running. The VM is force-stopped during the copy.
+func (m *Manager) MigrateDisk(vmName, targetPool string) error {
+	dom, err := m.conn.LookupDomainByName(vmName)
 	if err != nil {
-		return "", fmt.Errorf("getting volume path: %w", err)
+		return fmt.Errorf("looking up domain %q: %w", vmName, err)
 	}
-	return path, nil
+	defer dom.Free()
+
+	state, _, err := dom.GetState()
+	if err != nil {
+		return fmt.Errorf("getting VM state: %w", err)
+	}
+	wasRunning := state == libvirt.DOMAIN_RUNNING || state == libvirt.DOMAIN_PAUSED
+
+	xmlDesc, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return fmt.Errorf("getting domain XML: %w", err)
+	}
+	oldPath := parseDiskSourcePath(xmlDesc)
+	if oldPath == "" {
+		return fmt.Errorf("could not find disk source path in domain XML")
+	}
+
+	if wasRunning {
+		if err := dom.Destroy(); err != nil {
+			return fmt.Errorf("stopping VM: %w", err)
+		}
+	}
+
+	oldVol, err := m.conn.LookupStorageVolByPath(oldPath)
+	if err != nil {
+		return fmt.Errorf("looking up volume at %q: %w", oldPath, err)
+	}
+	defer oldVol.Free()
+
+	pool, err := m.conn.LookupStoragePoolByName(targetPool)
+	if err != nil {
+		return fmt.Errorf("looking up pool %q: %w", targetPool, err)
+	}
+	defer pool.Free()
+
+	volInfo, err := oldVol.GetInfo()
+	if err != nil {
+		return fmt.Errorf("getting volume info: %w", err)
+	}
+	volName, err := oldVol.GetName()
+	if err != nil {
+		return fmt.Errorf("getting volume name: %w", err)
+	}
+
+	volXML := fmt.Sprintf(`<volume>
+  <name>%s</name>
+  <capacity>%d</capacity>
+  <target>
+    <format type='qcow2'/>
+  </target>
+</volume>`, volName, volInfo.Capacity)
+
+	newVol, err := pool.StorageVolCreateXMLFrom(volXML, oldVol, 0)
+	if err != nil {
+		return fmt.Errorf("copying volume to pool %q: %w", targetPool, err)
+	}
+	defer newVol.Free()
+
+	newPath, err := newVol.GetPath()
+	if err != nil {
+		return fmt.Errorf("getting new volume path: %w", err)
+	}
+
+	newXML := strings.Replace(xmlDesc, oldPath, newPath, 1)
+	if _, err := m.conn.DomainDefineXML(newXML); err != nil {
+		return fmt.Errorf("redefining domain: %w", err)
+	}
+
+	if err := oldVol.Delete(0); err != nil {
+		return fmt.Errorf("deleting old volume: %w", err)
+	}
+
+	if wasRunning {
+		dom2, err := m.conn.LookupDomainByName(vmName)
+		if err != nil {
+			return fmt.Errorf("looking up domain after redefine: %w", err)
+		}
+		defer dom2.Free()
+		if err := dom2.Create(); err != nil {
+			return fmt.Errorf("restarting VM: %w", err)
+		}
+	}
+
+	return nil
 }

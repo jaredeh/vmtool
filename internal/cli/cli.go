@@ -29,6 +29,8 @@ func Execute() error {
 		networksCmd(),
 		playbookCmd(),
 		imagesCmd(),
+		poolCmd(),
+		migrateDiskCmd(),
 	)
 
 	return root.Execute()
@@ -50,6 +52,7 @@ func createCmd() *cobra.Command {
 		vcpus      uint
 		memoryMiB  uint
 		diskSizeGB uint
+		pool       string
 		netType    string
 		netSource  string
 		sshUser    string
@@ -86,6 +89,9 @@ upgrades) will be written back to the source image.`,
 			}
 			if netType != "" {
 				cfg.Network.Type = vmtool.NetworkType(netType)
+			}
+			if pool != "" {
+				cfg.Pool = pool
 			}
 			if netSource != "" {
 				cfg.Network.Source = netSource
@@ -145,6 +151,7 @@ upgrades) will be written back to the source image.`,
 	cmd.Flags().StringVar(&sshPass, "ssh-pass", "", "SSH password (default packer)")
 	cmd.Flags().StringVar(&inventory, "inventory", "ansible/inventory.yml", "path to write Ansible inventory file")
 	cmd.Flags().StringVar(&playbook, "playbook", "", "path to Ansible playbook to run after creation")
+	cmd.Flags().StringVar(&pool, "pool", "", "storage pool for the cloned disk (default: default)")
 	cmd.Flags().BoolVar(&noclone, "noclone", false, "boot directly from the image without cloning (changes persist to source)")
 
 	return cmd
@@ -393,6 +400,74 @@ func imagesCmd() *cobra.Command {
 			for _, img := range images {
 				fmt.Println(img)
 			}
+			return nil
+		}),
+	}
+}
+
+func poolCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pool",
+		Short: "Manage storage pools",
+	}
+	cmd.AddCommand(poolListCmd(), poolCreateCmd())
+	return cmd
+}
+
+func poolListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "list",
+		Short:   "List storage pools",
+		Aliases: []string{"ls"},
+		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
+			pools, err := m.ListPools()
+			if err != nil {
+				return err
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "NAME\tPATH\tACTIVE")
+			for _, p := range pools {
+				active := "no"
+				if p.Active {
+					active = "yes"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\n", p.Name, p.Path, active)
+			}
+			return w.Flush()
+		}),
+	}
+}
+
+func poolCreateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "create <name> <path>",
+		Short: "Create a new directory-type storage pool",
+		Args:  cobra.ExactArgs(2),
+		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
+			if err := m.CreatePool(args[0], args[1]); err != nil {
+				return err
+			}
+			fmt.Printf("Pool %q created at %s\n", args[0], args[1])
+			return nil
+		}),
+	}
+}
+
+func migrateDiskCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "migrate-disk <vm> <pool>",
+		Short: "Move a VM's disk to a different storage pool",
+		Long: `Stop the VM (if running), copy its disk volume to the target pool,
+redefine the domain with the new path, then restart (if it was running).`,
+		Args: cobra.ExactArgs(2),
+		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
+			vmName := args[0]
+			pool := args[1]
+			fmt.Printf("Migrating disk for VM %q to pool %q...\n", vmName, pool)
+			if err := m.MigrateDisk(vmName, pool); err != nil {
+				return err
+			}
+			fmt.Printf("VM %q disk migrated to pool %q\n", vmName, pool)
 			return nil
 		}),
 	}

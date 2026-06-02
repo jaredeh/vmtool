@@ -65,9 +65,8 @@ func domainXML(cfg VMConfig) string {
     <console type='pty'>
       <target type='serial' port='0'/>
     </console>
-    <graphics type='spice' autoport='yes'>
-      <listen type='address'/>
-      <image compression='off'/>
+    <graphics type='vnc' port='-1' autoport='yes'>
+      <listen type='address' address='127.0.0.1'/>
     </graphics>
     <video>
       <model type='qxl' ram='65536' vram='65536' vgamem='16384' heads='1' primary='yes'/>

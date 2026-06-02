@@ -56,11 +56,17 @@ func createCmd() *cobra.Command {
 		sshPass    string
 		inventory  string
 		playbook   string
+		noclone    bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "create <name> <image>",
 		Short: "Define and start a new VM",
+		Long:  `Define and start a new VM from a disk image.
+
+By default the image is cloned so the original is unchanged.
+Use --noclone to boot directly from the image; any changes (e.g. package
+upgrades) will be written back to the source image.`,
 		Args:  cobra.ExactArgs(2),
 		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -90,6 +96,7 @@ func createCmd() *cobra.Command {
 			if sshPass != "" {
 				cfg.SSHPass = sshPass
 			}
+			cfg.Noclone = noclone
 			if err := m.Create(cfg); err != nil {
 				return err
 			}
@@ -138,6 +145,7 @@ func createCmd() *cobra.Command {
 	cmd.Flags().StringVar(&sshPass, "ssh-pass", "", "SSH password (default packer)")
 	cmd.Flags().StringVar(&inventory, "inventory", "ansible/inventory.yml", "path to write Ansible inventory file")
 	cmd.Flags().StringVar(&playbook, "playbook", "", "path to Ansible playbook to run after creation")
+	cmd.Flags().BoolVar(&noclone, "noclone", false, "boot directly from the image without cloning (changes persist to source)")
 
 	return cmd
 }
@@ -188,18 +196,27 @@ func destroyCmd() *cobra.Command {
 }
 
 func deleteCmd() *cobra.Command {
-	return &cobra.Command{
+	var noclone bool
+
+	cmd := &cobra.Command{
 		Use:   "delete <name>",
 		Short: "Stop and undefine a VM",
+		Long: `Stop and undefine a VM.
+
+By default also deletes the cloned disk volume.
+Use --noclone to skip volume deletion (use when the VM was created with --noclone).`,
 		Args:  cobra.ExactArgs(1),
 		RunE: withManager(func(m *vmtool.Manager, cmd *cobra.Command, args []string) error {
-			if err := m.Delete(args[0]); err != nil {
+			if err := m.Delete(args[0], noclone); err != nil {
 				return err
 			}
 			fmt.Printf("VM %q deleted\n", args[0])
 			return nil
 		}),
 	}
+
+	cmd.Flags().BoolVar(&noclone, "noclone", false, "undefine only, do not delete the disk volume")
+	return cmd
 }
 
 func listCmd() *cobra.Command {

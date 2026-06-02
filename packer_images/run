@@ -18,25 +18,87 @@ SHORT_DESC="Building images"
 VALID_COMMANDS=("distclean:Perform a deep clean of the code repos"
                 "clean:Clean the code repos"
                 "generate:Generate code from specs"
-                "build:Build the code"
-                "upload:Upload the docker image"
-                "clienttest:Run client test"
-                "install:Install the project to the instance"
+                "update:Run vm_upgrade.yml on the default image"
                 "help:Show help for TARGET")
 VALID_FLAGS=("--help|-h:Show help for this script"
                "--debug:Enable debug mode"
                "--dryrun:Dryrun.  Don't actually run the commands"
                "--verbose:Verbose output")
-FLAGS_EXPANSIONS=("--debug:--debug --verbose")
-COMMAND_EXPANSIONS=("distclean:distclean clean"
-                    "init:generate init")
+VALID_OPTIONS=("--template=<str>:generate:Template dir name (default: ubuntu2404)"
+               "--template=<str>:update:Template dir name (default: ubuntu2404)")
 
-FLAGS=("--verbose")
+FLAGS=()
 COMMANDS=()
-COMMANDS+=($1)
+for arg in "$@"; do
+  case "$arg" in
+    --*=*)
+      key="${arg%%=*}"; key="${key#--}"
+      val="${arg#*=}"
+      # Check: Command must be defined before the option
+      if [[ ${#COMMANDS[@]} -eq 0 ]]; then
+        echo "Error: Option '$arg' requires a command to be specified first." >&2; exit 1
+      fi
+      # Check: Option must be valid for the current command
+      if grep -q "\-\-$key=<.*>.*${COMMANDS[0]}" <<< "${VALID_OPTIONS[*]}"; then
+        OPTIONS+=("$key=$val")
+      else
+        echo "Error: Option '$arg' is not allowed for command '${COMMANDS[0]}'." >&2; exit 1
+      fi
+      ;;
+    --*)
+      FLAGS+=("$arg")
+      ;;
+    *)
+      # Check: Only one command allowed
+      if [[ ${#COMMANDS[@]} -gt 0 ]]; then
+        echo "Error: Multiple commands detected ('${COMMANDS[0]}' and '$arg')." >&2; exit 1
+      fi
+      COMMANDS+=("$arg")
+      ;;
+  esac
+done
+
+# find largest command/flag/target name length
+get_max_length() {
+  max_length=0
+  for cmd in "${VALID_COMMANDS[@]} ${VALID_FLAGS[@]} ${VALID_TARGETS[@]}"; do
+    IFS=':' read -r command description <<< "$cmd"
+    if [ ${#command} -gt $max_length ]; then
+      max_length=${#command}
+    fi
+  done
+  echo $((max_length+4))
+}
+
+show_usage() {
+  echo ""
+  echo "  Usage: $SCRIPT_PATH [flags] <command>"
+  echo ""
+  echo "  Commands:"
+  for cmd in "${VALID_COMMANDS[@]}"; do
+    IFS=':' read -r command description <<< "$cmd"
+    printf "  %-*s %s\n" $(get_max_length) "$command" "$description"
+  done
+  echo "Flags:"
+  for flg in "${VALID_FLAGS[@]}"; do
+    IFS=':' read -r flags description <<< "$flg"
+    printf "  %-*s %s\n" $(get_max_length) "$flags" "$description"
+  done
+  if [ ! -z "${COMMANDS[0]}" ]; then
+    echo "Options:"
+    for opt in "${VALID_OPTIONS[@]}"; do
+      IFS=':' read -r option package description <<< "$opt"
+      IFS='=' read -r optionname valuename <<< "$option"
+      if [ "$package" == "${COMMANDS[0]}" ]; then
+        printf "  %-*s %s, %s\n" $(get_max_length) "$optionname" "$valuename" "$description"
+      fi
+    done
+  fi
+  echo ""
+}
 
 
-# find an flag in a list of valid flags
+# find a flag in the FLAGS array
 parse_flags() {
   local i=$1
   for flag in "${FLAGS[@]}"; do
@@ -47,6 +109,17 @@ parse_flags() {
   done
 }
 
+# find an option in a list of options
+parse_options() {
+  local i=$1
+  for option in "${OPTIONS[@]}"; do
+    IFS='=' read -r option_name argvalue <<< "$option"
+    if [ "$option_name" == "$i" ]; then
+      echo "$argvalue"
+      break
+    fi
+  done
+}
 
 # Allows --dryrun to not actually run the commands
 # also allows --verbose to show the commands being run
@@ -79,13 +152,34 @@ PACKER_OUTPUT="$PACKER_BASEDIR/output"
 PACKER_IMAGE_DEFS="$PACKER_BASEDIR/qemu_images"
 ANSIBLE_DIR="$( cd ${SCRIPT_DIR}/../ansible &> /dev/null && pwd )"
 
-export PKR_VAR_distro="ubuntu2404"
+TEMPLATE_DIR="./qemu_images"
+TEMPLATE=$(parse_options template)
+if [[ -n "$TEMPLATE" ]]; then
+  # Check if the directory exists and if the provided template matches a folder name
+  if [[ -d "$TEMPLATE_DIR/$TEMPLATE" ]]; then
+    export PKR_VAR_distro="$TEMPLATE"
+  else
+    echo "Error: Invalid template '$TEMPLATE'."
+    echo "Available templates in $TEMPLATE_DIR:"
+    # List only the top-level directory names
+    ls -1 "$TEMPLATE_DIR"
+    exit 1
+  fi
+else
+  # Default fallback
+  export PKR_VAR_distro="ubuntu2404"
+fi
 
 export PKR_VAR_username="packer"
 export PKR_VAR_password="packer"
 export PKR_VAR_output_directory="$PACKER_OUTPUT/${PKR_VAR_distro}"
 export PKR_VAR_hashedpassword="$(hash_password $PKR_VAR_password)"
 
+
+if [ ! -z "$(parse_flags '--help')" ] || [ ! -z "$(parse_flags '-h')" ] || [ ${#COMMANDS[@]} -eq 0 ]; then
+  show_usage
+  exit 0
+fi
 
 echo "PACKER_BASEDIR: $PACKER_BASEDIR"
 echo "PACKER_OUTPUT: $PACKER_OUTPUT"
@@ -110,8 +204,22 @@ for COMMAND in "${COMMANDS[@]}"; do
       echo "  Cleaning..."
       run_command "rm -rf ${PKR_VAR_output_directory}"
       ;;
+    update)
+      echo "  Updating ($PKR_VAR_distro) image..."
+      TMPVM="${PKR_VAR_distro}-update"
+      TMPINV=$(mktemp /tmp/ansible-inventory-XXXXXX.yml)
+      VMTOOL="${SCRIPT_DIR}/../vmtool"
+
+      # Clean up leftover state from any previous failed run
+      "${VMTOOL}" delete "$TMPVM" 2>/dev/null || true
+
+      run_command "${VMTOOL} create --noclone ${TMPVM} ${PKR_VAR_distro}.qcow2"
+      #run_command "${VMTOOL} playbook ${TMPVM} ${ANSIBLE_DIR}/playbooks/vm_upgrade.yml --inventory ${ANSIBLE_DIR}/inventory.yml --ssh-pass ${PKR_VAR_username} --ssh-pass ${PKR_VAR_password}"
+      #run_command "${VMTOOL} delete --noclone ${TMPVM}"
+      rm -f "$TMPINV"
+      ;;
     generate)
-      echo "  Generate..."
+      echo "  Generate ($PKR_VAR_distro)..."
       run_command "rm -rf ${PACKER_OUTPUT}"
       # Uses PKR_VAR_* variables...
       cd ${PACKER_IMAGE_DEFS}/${PKR_VAR_distro}/http

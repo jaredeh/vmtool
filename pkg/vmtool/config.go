@@ -39,6 +39,7 @@ type VMConfig struct {
 	Network    NetworkConfig
 	SSHUser    string
 	SSHPass    string
+	Noclone    bool
 }
 
 // DefaultConfig returns a VMConfig with sensible defaults.

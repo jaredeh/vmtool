@@ -411,7 +411,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			vmName := vm.Name
 			m.confirmMsg = fmt.Sprintf("Delete %q? This will destroy the VM and remove its disk.", vmName)
 			m.confirmAction = func() (tea.Model, tea.Cmd) {
-				err := m.manager.Delete(vmName)
+				err := m.manager.Delete(vmName, false)
 				if err != nil {
 					idx := m.addLog(fmt.Sprintf("delete %s: error: %v", vmName, err))
 					m.log[idx].status = logStatusError

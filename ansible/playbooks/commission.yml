@@ -1,0 +1,53 @@
+---
+- name: Commission VM - make cloned image instance-unique
+  hosts: all
+  become: true
+  tasks:
+
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Update /etc/hosts with new hostname
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1 {{ inventory_hostname }}"
+
+    - name: Reset machine-id
+      copy:
+        content: ""
+        dest: /etc/machine-id
+
+    - name: Generate new machine-id
+      command: systemd-machine-id-setup
+
+    - name: Sync dbus machine-id
+      file:
+        path: /var/lib/dbus/machine-id
+        src: /etc/machine-id
+        state: link
+        force: true
+
+    - name: Remove shared SSH host keys
+      shell: rm -f /etc/ssh/ssh_host_*
+
+    - name: Generate new SSH host keys
+      command: ssh-keygen -A
+
+    - name: Remove random seed so fresh entropy is generated on boot
+      file:
+        path: /var/lib/systemd/random-seed
+        state: absent
+
+    - name: Clear root bash history
+      copy:
+        content: ""
+        dest: /root/.bash_history
+
+    - name: Clean apt cache
+      command: apt-get clean
+
+    - name: Reboot to apply machine-id and hostname changes
+      reboot:
+        reboot_timeout: 120

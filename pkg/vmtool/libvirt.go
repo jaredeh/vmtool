@@ -182,14 +182,16 @@ func (m *Manager) CloneImage(baseImage, newName string) (string, error) {
 // cfg.DiskPath should be the path to the base image (from ImagePath).
 // It will be replaced with the path to the cloned volume.
 func (m *Manager) Create(cfg VMConfig) error {
-	clonedPath, err := m.CloneImage(
-		filepath.Base(cfg.DiskPath),
-		cfg.Name,
-	)
-	if err != nil {
-		return fmt.Errorf("cloning image: %w", err)
+	if !cfg.Noclone {
+		clonedPath, err := m.CloneImage(
+			filepath.Base(cfg.DiskPath),
+			cfg.Name,
+		)
+		if err != nil {
+			return fmt.Errorf("cloning image: %w", err)
+		}
+		cfg.DiskPath = clonedPath
 	}
-	cfg.DiskPath = clonedPath
 
 	if cfg.DiskSizeGB > 0 {
 		if err := m.ResizeVolume(cfg.Name+".qcow2", uint64(cfg.DiskSizeGB)*1024*1024*1024); err != nil {
@@ -221,7 +223,7 @@ func (m *Manager) ResizeVolume(volName string, sizeBytes uint64) error {
 }
 
 // Delete stops (force), undefines a VM, and removes its cloned disk volume.
-func (m *Manager) Delete(name string) error {
+func (m *Manager) Delete(name string, noclone bool) error {
 	dom, err := m.conn.LookupDomainByName(name)
 	if err != nil {
 		return fmt.Errorf("looking up domain %q: %w", name, err)
@@ -240,6 +242,11 @@ func (m *Manager) Delete(name string) error {
 
 	if err := dom.Undefine(); err != nil {
 		return fmt.Errorf("undefining domain: %w", err)
+	}
+
+	// If noclone we don't want to clean up the disk
+	if noclone {
+		return nil
 	}
 
 	// Clean up the cloned volume

@@ -1,0 +1,127 @@
+---
+# Install BitFlux kernel + daemon via the official Ubuntu installer.
+# Mirrors apps/ami_ubuntu2404/template.pkr.hcl provisioner flow:
+#   curl http://apt.bitflux.ai/ubuntu_installer.sh
+#   sudo ./ubuntu_installer.sh --kernel --bitflux --verbose [--deviceid <id>]
+#
+# After install, the first unused whole disk (no partitions, no mount, no
+# filesystem — typically vdb from create --extra-disk-size or add-disk) is
+# formatted as swap and persisted in fstab. A rerun is a no-op if that disk
+# is already swap. No unused disk → skip swap, do not fail.
+- name: Install BitFlux
+  hosts: all
+  become: true
+  vars:
+    # Optional. vmtool passes the VM name as --extra-var deviceid=<name>.
+    # Bare ansible-playbook without -e leaves this empty and skips --deviceid.
+    deviceid: ""
+
+  tasks:
+    - name: Install curl
+      apt:
+        name: curl
+        state: present
+        update_cache: yes
+
+    - name: Download BitFlux Ubuntu installer
+      get_url:
+        url: http://apt.bitflux.ai/ubuntu_installer.sh
+        dest: /tmp/ubuntu_installer.sh
+        mode: "0755"
+
+    - name: Run BitFlux installer (kernel + bitfluxd)
+      command:
+        argv: "{{ ['/tmp/ubuntu_installer.sh', '--kernel', '--bitflux', '--verbose'] + (['--deviceid', deviceid] if deviceid | default('') | length > 0 else []) }}"
+
+    - name: Remove installer script
+      file:
+        path: /tmp/ubuntu_installer.sh
+        state: absent
+
+    # Prefer an existing whole-disk swap (rerun). Else the first disk with no
+    # partitions, no mount, and no filesystem — typically vdb from add-disk.
+    - name: Find first unused block device for swap
+      shell: |
+        first_swap=""
+        first_unused=""
+        for d in $(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" { print $1 }'); do
+          dev="/dev/$d"
+          if [ "$(lsblk -n -o NAME "$dev" | wc -l)" -gt 1 ]; then
+            continue
+          fi
+          mp=$(lsblk -n -o MOUNTPOINT "$dev" | head -1 | tr -d '[:space:]')
+          if [ -n "$mp" ]; then
+            continue
+          fi
+          fstype=$(lsblk -n -o FSTYPE "$dev" | head -1 | tr -d '[:space:]')
+          if [ "$fstype" = "swap" ]; then
+            [ -z "$first_swap" ] && first_swap=$dev
+            continue
+          fi
+          if [ -z "$fstype" ] && ! blkid "$dev" >/dev/null 2>&1; then
+            [ -z "$first_unused" ] && first_unused=$dev
+          fi
+        done
+        echo "${first_swap:-$first_unused}"
+      args:
+        executable: /bin/bash
+      register: swap_bdev_cmd
+      changed_when: false
+
+    - name: Remember swap device
+      set_fact:
+        swap_bdev: "{{ swap_bdev_cmd.stdout | trim }}"
+
+    - name: No unused disk for dedicated swap
+      debug:
+        msg: "No unused block device found; skip dedicated swap (vmtool add-disk <vm> <size-gb>, then rerun)"
+      when: swap_bdev | length == 0
+
+    - name: Format unused disk as swap
+      filesystem:
+        fstype: swap
+        dev: "{{ swap_bdev }}"
+      when: swap_bdev | length > 0
+
+    - name: Read swap UUID
+      command: blkid -s UUID -o value {{ swap_bdev }}
+      register: swap_uuid_cmd
+      changed_when: false
+      when: swap_bdev | length > 0
+
+    - name: Persist swap in fstab
+      mount:
+        src: "UUID={{ swap_uuid_cmd.stdout }}"
+        path: none
+        fstype: swap
+        opts: sw
+        state: present
+      when: swap_bdev | length > 0 and swap_uuid_cmd.stdout | default('') | length > 0
+
+    - name: List active swap
+      command: swapon --show=NAME --noheadings
+      register: swap_active
+      changed_when: false
+      when: swap_bdev | length > 0
+
+    - name: Activate swap
+      command: swapon --uuid {{ swap_uuid_cmd.stdout }}
+      when:
+        - swap_bdev | length > 0
+        - swap_uuid_cmd.stdout | default('') | length > 0
+        - swap_bdev not in (swap_active.stdout | default(''))
+        - swap_uuid_cmd.stdout not in (swap_active.stdout | default(''))
+
+    - name: Reboot to load BitFlux kernel
+      reboot:
+        reboot_timeout: 300
+
+    - name: Confirm BitFlux/swaphints kernel is running
+      command: uname -a
+      register: uname_a
+      changed_when: false
+      failed_when: "'swaphints' not in uname_a.stdout and 'bitflux' not in uname_a.stdout"
+
+    - name: Show running kernel
+      debug:
+        var: uname_a.stdout

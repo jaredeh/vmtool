@@ -29,28 +29,37 @@ type NetworkConfig struct {
 	MacvtapMode MacvtapMode // only used for NetworkDirect
 }
 
+// DiskDevice is a file-backed virtio disk on a domain.
+type DiskDevice struct {
+	Path   string
+	Target string // guest device name, e.g. vda, vdb
+}
+
 // VMConfig holds the parameters for defining a VM.
 type VMConfig struct {
-	Name       string
-	VCPUs      uint
-	MemoryMiB  uint
-	DiskPath   string
-	DiskSizeGB uint // 0 means use the base image size as-is
-	Pool       string
-	Network    NetworkConfig
-	SSHUser    string
-	SSHPass    string
-	Noclone    bool
+	Name            string
+	VCPUs           uint
+	Memory          uint // GiB
+	DiskPath        string
+	DiskSizeGB      uint // 0 means use the base image size as-is
+	Pool            string
+	Network         NetworkConfig
+	SSHUser         string
+	SSHPass         string
+	Noclone         bool
+	ExtraDiskSizeGB uint         // 0 means no second disk
+	ExtraDiskPool   string       // empty uses Pool
+	ExtraDisks      []DiskDevice // extra disks included in domain XML
 }
 
 // DefaultConfig returns a VMConfig with sensible defaults.
 func DefaultConfig(name, diskPath string) VMConfig {
 	return VMConfig{
-		Name:      name,
-		VCPUs:     2,
-		MemoryMiB: 2048,
-		DiskPath:  diskPath,
-		Pool:      "default",
+		Name:     name,
+		VCPUs:    2,
+		Memory:   2,
+		DiskPath: diskPath,
+		Pool:     "default",
 		Network: NetworkConfig{
 			Type:   NetworkNAT,
 			Source: "default",
@@ -64,20 +73,20 @@ func DefaultConfig(name, diskPath string) VMConfig {
 type VMState string
 
 const (
-	StateRunning    VMState = "running"
-	StateShutoff    VMState = "shutoff"
-	StatePaused     VMState = "paused"
-	StateCrashed    VMState = "crashed"
-	StateUndefined  VMState = "undefined"
-	StateUnknown    VMState = "unknown"
+	StateRunning   VMState = "running"
+	StateShutoff   VMState = "shutoff"
+	StatePaused    VMState = "paused"
+	StateCrashed   VMState = "crashed"
+	StateUndefined VMState = "undefined"
+	StateUnknown   VMState = "unknown"
 )
 
 // VMInfo holds runtime information about a VM.
 type VMInfo struct {
-	Name      string
-	State     VMState
-	VCPUs     uint
-	MemoryMiB uint
-	IP        string
-	Autostart bool
+	Name      string  `json:"name"`
+	State     VMState `json:"state"`
+	VCPUs     uint    `json:"vcpus"`
+	Memory    uint    `json:"memory"` // GiB
+	IP        string  `json:"ip"`
+	Autostart bool    `json:"autostart"`
 }

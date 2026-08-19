@@ -5,8 +5,28 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
+
+func extraVarArgs(extraVars map[string]string) []string {
+	if len(extraVars) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(extraVars))
+	for k := range extraVars {
+		if k == "" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+extraVars[k])
+	}
+	return out
+}
 
 // ListPlaybooks returns the names of .yml files in the given directory.
 func ListPlaybooks(dir string) ([]string, error) {
@@ -16,7 +36,11 @@ func ListPlaybooks(dir string) ([]string, error) {
 	}
 	var playbooks []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".yml") {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasSuffix(n, ".yml") || strings.HasSuffix(n, ".yaml") {
 			playbooks = append(playbooks, e.Name())
 		}
 	}
@@ -24,13 +48,15 @@ func ListPlaybooks(dir string) ([]string, error) {
 }
 
 // RunPlaybook executes an ansible-playbook against the given inventory file.
+// extraVars are passed as repeated --extra-vars key=value.
 // Returns the combined stdout/stderr output and any error.
-func RunPlaybook(inventoryPath, playbookPath string) (string, error) {
-	cmd := exec.Command("ansible-playbook",
-		"--inventory", inventoryPath,
-		playbookPath,
-	)
-	cmd.Env = append(os.Environ(), "ANSIBLE_HOST_KEY_CHECKING=False")
+func RunPlaybook(inventoryPath, playbookPath string, extraVars map[string]string) (string, error) {
+	args := []string{"--inventory", inventoryPath, playbookPath}
+	for _, kv := range extraVarArgs(extraVars) {
+		args = append(args, "--extra-vars", kv)
+	}
+	cmd := exec.Command("ansible-playbook", args...)
+	cmd.Env = ansibleEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("running playbook %s: %w", filepath.Base(playbookPath), err)
@@ -47,12 +73,19 @@ func RunCommand(inventoryPath, command string) (string, error) {
 		"--module-name", "shell",
 		"--args", command,
 	)
-	cmd.Env = append(os.Environ(), "ANSIBLE_HOST_KEY_CHECKING=False")
+	cmd.Env = ansibleEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("running command: %w", err)
 	}
 	return string(out), nil
+}
+
+func ansibleEnv() []string {
+	return append(os.Environ(),
+		"ANSIBLE_HOST_KEY_CHECKING=False",
+		"ANSIBLE_SSH_ARGS=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+	)
 }
 
 // GrowDisk expands the root partition and filesystem to fill the disk.
@@ -66,15 +99,13 @@ func GrowDisk(inventoryPath string) error {
 
 // EnsureInventory checks if the inventory file has the correct IP for the VM,
 // and overwrites it if not.
-func EnsureInventory(path, ip, sshUser, sshPass string) (bool, error) {
+func EnsureInventory(path, name, ip string, auth Auth) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// File doesn't exist, write it
-		return true, WriteInventory(path, ip, sshUser, sshPass)
+		return true, WriteInventory(path, name, ip, auth)
 	}
-	// Check if the IP is already in the file
-	if strings.Contains(string(data), ip+":") {
+	if strings.Contains(string(data), "ansible_host: "+ip) {
 		return false, nil
 	}
-	return true, WriteInventory(path, ip, sshUser, sshPass)
+	return true, WriteInventory(path, name, ip, auth)
 }

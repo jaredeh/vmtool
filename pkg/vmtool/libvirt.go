@@ -37,11 +37,38 @@ func (m *Manager) Close() error {
 	return err
 }
 
+// diskXML is a single file-backed virtio disk device fragment.
+func diskXML(path, target string) string {
+	return fmt.Sprintf(`<disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='%s'/>
+      <target dev='%s' bus='virtio'/>
+    </disk>`, path, target)
+}
+
+func disksXML(cfg VMConfig) string {
+	var b strings.Builder
+	b.WriteString("    ")
+	b.WriteString(diskXML(cfg.DiskPath, "vda"))
+	for i, d := range cfg.ExtraDisks {
+		if d.Path == "" {
+			continue
+		}
+		target := d.Target
+		if target == "" {
+			target = fmt.Sprintf("vd%c", 'b'+i)
+		}
+		b.WriteString("\n    ")
+		b.WriteString(diskXML(d.Path, target))
+	}
+	return b.String()
+}
+
 // domainXML builds a full libvirt domain XML from a VMConfig.
 func domainXML(cfg VMConfig) string {
 	return fmt.Sprintf(`<domain type='kvm'>
   <name>%s</name>
-  <memory unit='MiB'>%d</memory>
+  <memory unit='GiB'>%d</memory>
   <vcpu>%d</vcpu>
   <os>
     <type arch='x86_64' machine='q35'>hvm</type>
@@ -53,11 +80,7 @@ func domainXML(cfg VMConfig) string {
   </features>
   <cpu mode='host-passthrough' check='none'/>
   <devices>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
-      <source file='%s'/>
-      <target dev='vda' bus='virtio'/>
-    </disk>
+%s
 %s
     <serial type='pty'>
       <target port='0'/>
@@ -79,7 +102,7 @@ func domainXML(cfg VMConfig) string {
       <backend model='random'>/dev/urandom</backend>
     </rng>
   </devices>
-</domain>`, cfg.Name, cfg.MemoryMiB, cfg.VCPUs, cfg.DiskPath, networkXML(cfg.Network))
+</domain>`, cfg.Name, cfg.Memory, cfg.VCPUs, disksXML(cfg), networkXML(cfg.Network))
 }
 
 // Define registers a VM with libvirt without starting it.
@@ -168,6 +191,9 @@ func (m *Manager) CloneImage(basePath, newName, targetPool string) (string, erro
 		return "", fmt.Errorf("getting base image info: %w", err)
 	}
 
+	if targetPool == "" {
+		targetPool = "default"
+	}
 	pool, err := m.conn.LookupStoragePoolByName(targetPool)
 	if err != nil {
 		return "", fmt.Errorf("looking up pool %q: %w", targetPool, err)
@@ -214,6 +240,18 @@ func (m *Manager) Create(cfg VMConfig) error {
 		}
 	}
 
+	if cfg.ExtraDiskSizeGB > 0 {
+		pool := cfg.ExtraDiskPool
+		if pool == "" {
+			pool = cfg.Pool
+		}
+		extra, err := m.createEmptyDisk(cfg.Name, cfg.ExtraDiskSizeGB, pool, []string{"vda"})
+		if err != nil {
+			return fmt.Errorf("creating extra disk: %w", err)
+		}
+		cfg.ExtraDisks = append(cfg.ExtraDisks, *extra)
+	}
+
 	if err := m.Define(cfg); err != nil {
 		return err
 	}
@@ -238,10 +276,12 @@ func (m *Manager) Delete(name string, noclone bool) error {
 	}
 	defer dom.Free()
 
-	var diskPath string
+	var diskPaths []string
 	if !noclone {
 		if xmlDesc, err := dom.GetXMLDesc(0); err == nil {
-			diskPath = parseDiskSourcePath(xmlDesc)
+			for _, d := range parseFileDisks(xmlDesc) {
+				diskPaths = append(diskPaths, d.Path)
+			}
 		}
 	}
 
@@ -259,18 +299,14 @@ func (m *Manager) Delete(name string, noclone bool) error {
 		return fmt.Errorf("undefining domain: %w", err)
 	}
 
-	if noclone || diskPath == "" {
+	if noclone || len(diskPaths) == 0 {
 		return nil
 	}
 
-	vol, err := m.conn.LookupStorageVolByPath(diskPath)
-	if err != nil {
-		return nil // no matching volume, nothing to clean up
-	}
-	defer vol.Free()
-
-	if err := vol.Delete(0); err != nil {
-		return fmt.Errorf("deleting volume at %q: %w", diskPath, err)
+	for _, diskPath := range diskPaths {
+		if err := m.deleteVolumeByPath(diskPath); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -314,7 +350,7 @@ func (m *Manager) Info(name string) (*VMInfo, error) {
 		Name:      name,
 		State:     domainState(state),
 		VCPUs:     uint(info.NrVirtCpu),
-		MemoryMiB: uint(info.MaxMem / 1024),
+		Memory:    uint(info.MaxMem / 1024 / 1024),
 		Autostart: autostart,
 	}
 
@@ -355,7 +391,7 @@ func (m *Manager) List() ([]VMInfo, error) {
 			Name:      name,
 			State:     domainState(state),
 			VCPUs:     uint(info.NrVirtCpu),
-			MemoryMiB: uint(info.MaxMem / 1024),
+			Memory:    uint(info.MaxMem / 1024 / 1024),
 			Autostart: autostart,
 		}
 		if state == libvirt.DOMAIN_RUNNING {
@@ -372,9 +408,9 @@ func (m *Manager) List() ([]VMInfo, error) {
 // falls back to ARP (works for bridge/direct-attached interfaces).
 func (m *Manager) getIP(dom *libvirt.Domain) (string, error) {
 	sources := []libvirt.DomainInterfaceAddressesSource{
-		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
 		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
 		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_ARP,
+		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
 	}
 	for _, src := range sources {
 		ifaces, err := dom.ListAllInterfaceAddresses(src)
@@ -548,19 +584,200 @@ func parsePoolPath(xml string) string {
 	return xml[si : si+ei]
 }
 
-// parseDiskSourcePath extracts the disk source file path from a domain XML descriptor.
+// parseDiskSourcePath extracts the first disk source file path from a domain XML descriptor.
 func parseDiskSourcePath(xml string) string {
-	const marker = "<source file='"
-	si := strings.Index(xml, marker)
+	disks := parseFileDisks(xml)
+	if len(disks) == 0 {
+		return ""
+	}
+	return disks[0].Path
+}
+
+// parseFileDisks returns every file-backed <disk> in a domain XML descriptor.
+func parseFileDisks(xml string) []DiskDevice {
+	var out []DiskDevice
+	rest := xml
+	for {
+		start := strings.Index(rest, "<disk")
+		if start == -1 {
+			break
+		}
+		rest = rest[start:]
+		end := strings.Index(rest, "</disk>")
+		if end == -1 {
+			break
+		}
+		block := rest[:end+len("</disk>")]
+		rest = rest[end+len("</disk>"):]
+		path := xmlAttr(block, "<source", "file")
+		target := xmlAttr(block, "<target", "dev")
+		if path == "" || target == "" {
+			continue
+		}
+		out = append(out, DiskDevice{Path: path, Target: target})
+	}
+	return out
+}
+
+// xmlAttr returns attr='…' from the first tag that starts with tagPrefix.
+func xmlAttr(block, tagPrefix, attr string) string {
+	ti := strings.Index(block, tagPrefix)
+	if ti == -1 {
+		return ""
+	}
+	tag := block[ti:]
+	if gt := strings.Index(tag, ">"); gt != -1 {
+		tag = tag[:gt]
+	}
+	marker := attr + "='"
+	si := strings.Index(tag, marker)
 	if si == -1 {
 		return ""
 	}
 	si += len(marker)
-	ei := strings.Index(xml[si:], "'")
+	ei := strings.Index(tag[si:], "'")
 	if ei == -1 {
 		return ""
 	}
-	return xml[si : si+ei]
+	return tag[si : si+ei]
+}
+
+func nextVirtioTarget(used []string) (string, error) {
+	taken := make(map[string]bool, len(used))
+	for _, t := range used {
+		taken[t] = true
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		t := "vd" + string(c)
+		if !taken[t] {
+			return t, nil
+		}
+	}
+	return "", fmt.Errorf("no free virtio disk target (vda–vdz all in use)")
+}
+
+func normalizeVolName(name string) string {
+	if name == "" {
+		return ""
+	}
+	if !strings.HasSuffix(name, ".qcow2") {
+		return name + ".qcow2"
+	}
+	return name
+}
+
+// extraVolName is the conventional volume name for disk N (2, 3, …).
+func extraVolName(vmName string, n int) string {
+	return fmt.Sprintf("%s-%d.qcow2", vmName, n)
+}
+
+func (m *Manager) deleteVolumeByPath(path string) error {
+	vol, err := m.conn.LookupStorageVolByPath(path)
+	if err != nil {
+		return nil // no matching volume, nothing to clean up
+	}
+	defer vol.Free()
+	if err := vol.Delete(0); err != nil {
+		return fmt.Errorf("deleting volume at %q: %w", path, err)
+	}
+	return nil
+}
+
+// CreateVolume creates an empty qcow2 volume in pool and returns its path.
+func (m *Manager) CreateVolume(poolName, volName string, sizeGB uint) (string, error) {
+	if sizeGB == 0 {
+		return "", fmt.Errorf("size must be greater than 0")
+	}
+	if poolName == "" {
+		poolName = "default"
+	}
+	volName = normalizeVolName(volName)
+	if volName == "" {
+		return "", fmt.Errorf("volume name is required")
+	}
+
+	pool, err := m.conn.LookupStoragePoolByName(poolName)
+	if err != nil {
+		return "", fmt.Errorf("looking up pool %q: %w", poolName, err)
+	}
+	defer pool.Free()
+
+	volXML := fmt.Sprintf(`<volume>
+  <name>%s</name>
+  <capacity unit='G'>%d</capacity>
+  <target>
+    <format type='qcow2'/>
+  </target>
+</volume>`, volName, sizeGB)
+
+	vol, err := pool.StorageVolCreateXML(volXML, 0)
+	if err != nil {
+		return "", fmt.Errorf("creating volume %q: %w", volName, err)
+	}
+	defer vol.Free()
+
+	path, err := vol.GetPath()
+	if err != nil {
+		return "", fmt.Errorf("getting volume path: %w", err)
+	}
+	return path, nil
+}
+
+func (m *Manager) createEmptyDisk(vmName string, sizeGB uint, pool string, usedTargets []string) (*DiskDevice, error) {
+	target, err := nextVirtioTarget(usedTargets)
+	if err != nil {
+		return nil, err
+	}
+	path, err := m.CreateVolume(pool, extraVolName(vmName, len(usedTargets)+1), sizeGB)
+	if err != nil {
+		return nil, err
+	}
+	return &DiskDevice{Path: path, Target: target}, nil
+}
+
+// AddDisk creates an empty qcow2 volume and attaches it as the next virtio disk.
+// Volume name is {vm}-N.qcow2 (N is 2 for the first extra disk, then 3, …).
+// Live + persistent when the domain is running or paused; persistent only when shut off.
+func (m *Manager) AddDisk(name string, sizeGB uint, pool string) (*DiskDevice, error) {
+	if sizeGB == 0 {
+		return nil, fmt.Errorf("size must be greater than 0")
+	}
+
+	dom, err := m.conn.LookupDomainByName(name)
+	if err != nil {
+		return nil, fmt.Errorf("looking up domain %q: %w", name, err)
+	}
+	defer dom.Free()
+
+	xmlDesc, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return nil, fmt.Errorf("getting domain XML: %w", err)
+	}
+	var used []string
+	for _, d := range parseFileDisks(xmlDesc) {
+		used = append(used, d.Target)
+	}
+
+	disk, err := m.createEmptyDisk(name, sizeGB, pool, used)
+	if err != nil {
+		return nil, err
+	}
+
+	flags := libvirt.DOMAIN_DEVICE_MODIFY_CONFIG
+	state, _, err := dom.GetState()
+	if err != nil {
+		_ = m.deleteVolumeByPath(disk.Path)
+		return nil, fmt.Errorf("getting VM state: %w", err)
+	}
+	if state == libvirt.DOMAIN_RUNNING || state == libvirt.DOMAIN_PAUSED {
+		flags |= libvirt.DOMAIN_DEVICE_MODIFY_LIVE
+	}
+
+	if err := dom.AttachDeviceFlags(diskXML(disk.Path, disk.Target), flags); err != nil {
+		_ = m.deleteVolumeByPath(disk.Path)
+		return nil, fmt.Errorf("attaching disk: %w", err)
+	}
+	return disk, nil
 }
 
 // DefaultPoolPath returns the filesystem path of the "default" storage pool.
@@ -611,6 +828,59 @@ func (m *Manager) ListImages() ([]string, error) {
 	return images, nil
 }
 
+// ListImagesByPool returns a map of pool name → .qcow2 image names.
+func (m *Manager) ListImagesByPool() (map[string][]string, error) {
+	pools, err := m.conn.ListAllStoragePools(0)
+	if err != nil {
+		return nil, fmt.Errorf("listing storage pools: %w", err)
+	}
+	result := make(map[string][]string)
+	for _, pool := range pools {
+		poolName, err := pool.GetName()
+		if err != nil {
+			pool.Free()
+			continue
+		}
+		vols, err := pool.ListAllStorageVolumes(0)
+		if err != nil {
+			pool.Free()
+			continue
+		}
+		for _, vol := range vols {
+			name, err := vol.GetName()
+			vol.Free()
+			if err != nil {
+				continue
+			}
+			if strings.HasSuffix(name, ".qcow2") {
+				result[poolName] = append(result[poolName], name)
+			}
+		}
+		pool.Free()
+	}
+	return result, nil
+}
+
+// DeleteImage deletes a .qcow2 volume from the named storage pool.
+func (m *Manager) DeleteImage(name, pool string) error {
+	p, err := m.conn.LookupStoragePoolByName(pool)
+	if err != nil {
+		return fmt.Errorf("looking up pool %q: %w", pool, err)
+	}
+	defer p.Free()
+
+	vol, err := p.LookupStorageVolByName(name)
+	if err != nil {
+		return fmt.Errorf("image %q not found in pool %q: %w", name, pool, err)
+	}
+	defer vol.Free()
+
+	if err := vol.Delete(0); err != nil {
+		return fmt.Errorf("deleting image %q: %w", name, err)
+	}
+	return nil
+}
+
 // ImagePath searches all storage pools for a volume by name and returns its path.
 func (m *Manager) ImagePath(name string) (string, error) {
 	pools, err := m.conn.ListAllStoragePools(0)
@@ -631,14 +901,14 @@ func (m *Manager) ImagePath(name string) (string, error) {
 		}
 		return path, nil
 	}
-	return "", fmt.Errorf("image %q not found in any storage pool", name)
+	return "", fmt.Errorf("image %q not found in any storage pool: %w", name, ErrNotFound)
 }
 
 // PoolInfo holds metadata about a storage pool.
 type PoolInfo struct {
-	Name   string
-	Path   string
-	Active bool
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Active bool   `json:"active"`
 }
 
 // ListPools returns metadata for all storage pools.
@@ -684,6 +954,67 @@ func (m *Manager) CreatePool(name, path string) error {
 	}
 	if err := pool.SetAutostart(true); err != nil {
 		return fmt.Errorf("setting pool autostart: %w", err)
+	}
+	return nil
+}
+
+// ResizeDisk grows a VM's disk volume to sizeGB gigabytes.
+// The new size must be larger than the current capacity.
+// Running/paused VMs are resized online via block resize (qemu holds the image
+// lock, so offline vol-resize cannot be used). Shut-off VMs use vol resize.
+func (m *Manager) ResizeDisk(name string, sizeGB uint) error {
+	if sizeGB == 0 {
+		return fmt.Errorf("size must be greater than 0")
+	}
+
+	dom, err := m.conn.LookupDomainByName(name)
+	if err != nil {
+		return fmt.Errorf("looking up domain %q: %w", name, err)
+	}
+	defer dom.Free()
+
+	xmlDesc, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return fmt.Errorf("getting domain XML: %w", err)
+	}
+	diskPath := parseDiskSourcePath(xmlDesc)
+	if diskPath == "" {
+		return fmt.Errorf("could not find disk source path in domain XML")
+	}
+
+	vol, err := m.conn.LookupStorageVolByPath(diskPath)
+	if err != nil {
+		return fmt.Errorf("looking up volume at %q: %w", diskPath, err)
+	}
+	defer vol.Free()
+
+	info, err := vol.GetInfo()
+	if err != nil {
+		return fmt.Errorf("getting volume info: %w", err)
+	}
+
+	sizeBytes := uint64(sizeGB) * 1024 * 1024 * 1024
+	if sizeBytes <= info.Capacity {
+		curGB := info.Capacity / (1024 * 1024 * 1024)
+		return fmt.Errorf("new size %dGB must be larger than current %dGB", sizeGB, curGB)
+	}
+
+	state, _, err := dom.GetState()
+	if err != nil {
+		return fmt.Errorf("getting VM state: %w", err)
+	}
+
+	// Online: qemu holds the image write lock, so vol.Resize (qemu-img) fails.
+	// BlockResize grows the disk through the running domain instead.
+	if state == libvirt.DOMAIN_RUNNING || state == libvirt.DOMAIN_PAUSED {
+		if err := dom.BlockResize("vda", sizeBytes, libvirt.DOMAIN_BLOCK_RESIZE_BYTES); err != nil {
+			return fmt.Errorf("resizing disk online: %w", err)
+		}
+		return nil
+	}
+
+	if err := vol.Resize(sizeBytes, 0); err != nil {
+		return fmt.Errorf("resizing volume: %w", err)
 	}
 	return nil
 }

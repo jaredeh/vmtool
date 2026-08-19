@@ -29,11 +29,14 @@
         state: link
         force: true
 
-    - name: Remove shared SSH host keys
-      shell: rm -f /etc/ssh/ssh_host_*
+    # Hostname / machine-id / dbus bounce sshd. Drop the dead session and wait.
+    - name: Reset SSH connection after identity changes
+      meta: reset_connection
 
-    - name: Generate new SSH host keys
-      command: ssh-keygen -A
+    - name: Wait for SSH after identity changes
+      wait_for_connection:
+        delay: 5
+        timeout: 120
 
     - name: Remove random seed so fresh entropy is generated on boot
       file:
@@ -47,6 +50,17 @@
 
     - name: Clean apt cache
       command: apt-get clean
+
+    # One shot: deleting keys then reconnecting leaves sshd with nothing to offer.
+    - name: Replace shared SSH host keys
+      shell: rm -f /etc/ssh/ssh_host_* && ssh-keygen -A
+
+    - name: Forget old SSH host key on the control node
+      command: ssh-keygen -R {{ ansible_host | default(inventory_hostname) }}
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      changed_when: false
 
     - name: Reboot to apply machine-id and hostname changes
       reboot:

@@ -1,0 +1,635 @@
+openapi: 3.0.3
+info:
+  title: vmtool API
+  version: 0.1.0
+  description: >
+    HTTP surface of `vmtool server`. Spec-first: models, stdlib ServerInterface,
+    embedded spec, and a test client are generated from this file. Interactive
+    SSH over the network is GET /vms/{name}/console (WebSocket upgrade; framing
+    in that operation's description). CLI `vmtool ssh` and TUI `t` still exec
+    ssh locally. Default bind is 127.0.0.1:9473, no auth. createVM and
+    runPlaybook are synchronous and may run for many minutes; clients must not
+    use a short HTTP timeout.
+servers:
+  - url: /
+paths:
+  /:
+    get:
+      operationId: getDocs
+      summary: Swagger UI for this API
+      description: >
+        Interactive OpenAPI reference (Swagger UI) that loads /openapi.yaml.
+        The machine-readable contract is GET /openapi.yaml or GET /openapi.json.
+      responses:
+        '200':
+          description: Swagger UI
+          content:
+            text/html:
+              schema: { type: string }
+  /openapi.yaml:
+    get:
+      operationId: getOpenAPISpec
+      summary: OpenAPI document (YAML)
+      responses:
+        '200':
+          description: the committed spec
+          content:
+            application/yaml:
+              schema: { type: string }
+  /openapi.json:
+    get:
+      operationId: getOpenAPIJSON
+      summary: OpenAPI document (JSON)
+      responses:
+        '200':
+          description: the committed spec as JSON
+          content:
+            application/json:
+              schema: { type: object }
+  /vms:
+    get:
+      operationId: listVMs
+      summary: List all VMs
+      responses:
+        '200':
+          description: VMs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/VMInfo' }
+        '500': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createVM
+      summary: Create and start a VM
+      description: >
+        Synchronous. May wait up to 120s for an IP and then run an optional
+        playbook. Clients need a long HTTP timeout. 201 means the domain is up
+        and every requested extra (grow, playbook, reboot) succeeded. Empty IP
+        is a valid 201 when no grow/playbook was requested. Failures after the
+        domain exists are 500; the VM is never auto-undefined.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateVMRequest' }
+            example:
+              name: web
+              image: ubuntu2404.qcow2
+              vcpus: 2
+              memory: 2
+              pool: default
+              net_type: nat
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    get:
+      operationId: getVM
+      summary: Show one VM
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteVM
+      summary: Stop and undefine a VM
+      parameters:
+        - name: noclone
+          in: query
+          required: false
+          description: if true, undefine only and keep the disk
+          schema: { type: boolean, default: false }
+      responses:
+        '204': { description: deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/start:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: startVM
+      summary: Start a stopped VM
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/stop:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: stopVM
+      summary: Graceful shutdown
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/resume:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: resumeVM
+      summary: Resume a paused VM
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/poweroff:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: poweroffVM
+      summary: Force power-off
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/reboot:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: rebootVM
+      summary: Reboot a running VM
+      description: >
+        ACPI reboot via libvirt. The domain stays defined and should come back
+        running if the guest handles the request. Distinct from stop (shutdown
+        to shutoff) and poweroff (forced destroy).
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/autostart:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    put:
+      operationId: setAutostart
+      summary: Enable or disable autostart
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AutostartRequest' }
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/cmd:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: runVMCommand
+      summary: Run a command over SSH
+      description: Returns remote stdout, stderr, and exit_code. 200 even when exit_code is non-zero. 502 if SSH transport fails.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CmdRequest' }
+            example:
+              command: [uname, -a]
+      responses:
+        '200':
+          description: remote result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CmdResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+  /vms/{name}/console:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    get:
+      operationId: openVMConsole
+      summary: Interactive SSH (WebSocket upgrade)
+      description: >
+        WebSocket upgrade. The handshake is HTTP; after 101 the connection is a
+        terminal, not request/response. Binary frames are raw PTY bytes to/from
+        `ssh -tt` using .machines credentials (same as `vmtool ssh`). Text
+        frames are JSON control: `{"type":"resize","cols":N,"rows":N}`. Closing
+        the socket kills ssh. Optional `cols` and `rows` set the initial PTY
+        size (default 80x24). Default bind is loopback with no auth; a browser
+        Origin that is not the request host or loopback is rejected (403).
+        Local `vmtool ssh` / TUI `t` do not use this socket.
+      parameters:
+        - name: cols
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: rows
+          in: query
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '101': { description: switching protocols to WebSocket }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+  /vms/{name}/playbook:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: runPlaybook
+      summary: Run an Ansible playbook against the VM
+      description: Synchronous; may run for many minutes. Bare names resolve under ansible/playbooks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaybookRequest' }
+            example:
+              playbook: setup_bot.yml
+      responses:
+        '200':
+          description: ansible finished
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlaybookResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '500':
+          description: ansible or orchestration failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlaybookResult' }
+  /vms/{name}/migrate-disk:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: migrateDisk
+      summary: Move the VM disk to another pool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MigrateDiskRequest' }
+      responses:
+        '200':
+          description: VM
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VMInfo' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/resize-disk:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: resizeDisk
+      summary: Grow the VM disk and filesystem if running
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResizeDiskRequest' }
+      responses:
+        '200':
+          description: volume resized; grow_error set if guest grow failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResizeDiskResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /vms/{name}/add-disk:
+    parameters:
+      - $ref: '#/components/parameters/VMName'
+    post:
+      operationId: addDisk
+      summary: Create an empty qcow2 volume and attach it to the VM
+      description: >
+        Creates a new empty qcow2 volume named {vm}-N.qcow2 (N starts at 2,
+        then 3 on the next call) and attaches it as the next virtio disk
+        (vdb, vdc, …). Live + persistent if the domain is running;
+        persistent only if it is shut off. The guest sees a raw block device;
+        it is not partitioned or formatted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddDiskRequest' }
+            example:
+              size: 50
+      responses:
+        '200':
+          description: disk attached
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AddDiskResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /networks:
+    get:
+      operationId: listNetworks
+      summary: List libvirt networks
+      responses:
+        '200':
+          description: network names
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        '500': { $ref: '#/components/responses/Error' }
+  /bridges:
+    get:
+      operationId: listBridges
+      summary: List host bridges
+      responses:
+        '200':
+          description: bridge names
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        '500': { $ref: '#/components/responses/Error' }
+  /images:
+    get:
+      operationId: listImages
+      summary: List disk images grouped by pool
+      responses:
+        '200':
+          description: map of pool name to image names
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items: { type: string }
+        '500': { $ref: '#/components/responses/Error' }
+  /images/{name}:
+    delete:
+      operationId: deleteImage
+      summary: Delete a disk image
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+        - name: pool
+          in: query
+          required: false
+          schema: { type: string, default: default }
+      responses:
+        '204': { description: deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /pools:
+    get:
+      operationId: listPools
+      summary: List storage pools
+      responses:
+        '200':
+          description: pools
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PoolInfo' }
+        '500': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createPool
+      summary: Create a directory storage pool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePoolRequest' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatePoolResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /playbooks:
+    get:
+      operationId: listPlaybooks
+      summary: List playbooks in ansible/playbooks
+      responses:
+        '200':
+          description: playbook filenames
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        '500': { $ref: '#/components/responses/Error' }
+
+components:
+  parameters:
+    VMName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        vm:
+          $ref: '#/components/schemas/VMInfo'
+        output:
+          type: string
+          description: ansible combined output when a playbook step failed
+    VMInfo:
+      type: object
+      required: [name, state, vcpus, memory, ip, autostart]
+      properties:
+        name: { type: string }
+        state:
+          type: string
+          enum: [running, shutoff, paused, crashed, undefined, unknown]
+        vcpus: { type: integer, minimum: 0 }
+        memory: { type: integer, minimum: 0, description: GiB }
+        ip: { type: string }
+        autostart: { type: boolean }
+    CreateVMRequest:
+      type: object
+      required: [name, image]
+      properties:
+        name: { type: string }
+        image: { type: string }
+        vcpus: { type: integer, minimum: 1 }
+        memory: { type: integer, minimum: 1, description: GiB }
+        disk_size: { type: integer, minimum: 0, description: GB }
+        pool: { type: string }
+        net_type:
+          type: string
+          enum: [nat, bridge, direct]
+          description: >
+            nat = libvirt virtual network (default). bridge = host bridge.
+            direct = macvtap on a physical NIC.
+        net_source:
+          type: string
+          description: >
+            Network name (nat), bridge name (bridge), or host NIC (direct).
+        macvtap_mode:
+          type: string
+          enum: [bridge, vepa, private, passthrough]
+          description: >
+            Only used when net_type is direct. Default bridge (VMs on the same
+            host NIC can see each other). vepa sends hairpin via an external
+            switch. private isolates guests from each other. passthrough gives
+            the guest exclusive use of the NIC.
+        ssh_user: { type: string }
+        ssh_pass: { type: string, description: sensitive; never log }
+        playbook:
+          type: string
+          description: Bare name under ansible/playbooks, or a path. After a successful playbook the guest is rebooted.
+        noclone:
+          type: boolean
+          description: >
+            If true, boot the image in place instead of cloning it. Disk writes
+            persist to the source image. Pair with DELETE ?noclone=true so the
+            source volume is not deleted.
+        extra_disk:
+          $ref: '#/components/schemas/AddDiskRequest'
+          description: >
+            Optional second virtio disk (vdb). Creates {name}-2.qcow2 and
+            attaches it when the domain is defined.
+        extra_vars:
+          $ref: '#/components/schemas/ExtraVars'
+          description: Ansible extra-vars for the optional create-time playbook.
+    AutostartRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+    CmdRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: array
+          items: { type: string }
+          minItems: 1
+    CmdResult:
+      type: object
+      required: [exit_code, stdout, stderr]
+      properties:
+        exit_code: { type: integer }
+        stdout: { type: string }
+        stderr: { type: string }
+    PlaybookRequest:
+      type: object
+      required: [playbook]
+      properties:
+        playbook: { type: string }
+        extra_vars:
+          $ref: '#/components/schemas/ExtraVars'
+    ExtraVars:
+      type: object
+      additionalProperties: { type: string }
+      description: >
+        Ansible extra-vars (`--extra-vars key=value`). vmtool always sets
+        deviceid to the VM name unless this map already contains deviceid.
+    PlaybookResult:
+      type: object
+      required: [output]
+      properties:
+        output: { type: string }
+        error: { type: string }
+    MigrateDiskRequest:
+      type: object
+      required: [pool]
+      properties:
+        pool: { type: string }
+    ResizeDiskRequest:
+      type: object
+      required: [size]
+      properties:
+        size: { type: integer, minimum: 1, description: GB }
+    ResizeDiskResult:
+      type: object
+      required: [vm, filesystem_grown]
+      properties:
+        vm: { $ref: '#/components/schemas/VMInfo' }
+        filesystem_grown: { type: boolean }
+        grow_error: { type: string }
+    AddDiskRequest:
+      type: object
+      required: [size]
+      properties:
+        size: { type: integer, minimum: 1, description: capacity in GB }
+        pool:
+          type: string
+          description: >
+            Storage pool for the new volume (default default). Volume name is
+            always {vm}-N.qcow2 (N is 2 for the first extra disk, then 3, …).
+    AddDiskResult:
+      type: object
+      required: [vm, path, target]
+      properties:
+        vm: { $ref: '#/components/schemas/VMInfo' }
+        path: { type: string, description: host path of the new volume }
+        target:
+          type: string
+          description: guest virtio device name (vdb, vdc, …)
+    CreatePoolRequest:
+      type: object
+      required: [name, path]
+      properties:
+        name: { type: string }
+        path: { type: string }
+    CreatePoolResult:
+      type: object
+      required: [name, path]
+      properties:
+        name: { type: string }
+        path: { type: string }
+    PoolInfo:
+      type: object
+      required: [name, path, active]
+      properties:
+        name: { type: string }
+        path: { type: string }
+        active: { type: boolean }

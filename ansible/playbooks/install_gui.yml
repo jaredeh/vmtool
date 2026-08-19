@@ -1,0 +1,52 @@
+---
+- name: Install Ubuntu desktop with packer user autologin
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Install Ubuntu desktop
+      apt:
+        name: ubuntu-desktop
+        state: present
+        update_cache: yes
+
+    - name: Install Chromium
+      apt:
+        name: chromium-browser
+        state: present
+        update_cache: yes
+
+    - name: Configure gdm3 autologin for packer user
+      copy:
+        dest: /etc/gdm3/custom.conf
+        mode: "0644"
+        content: |
+          [daemon]
+          AutomaticLoginEnable=True
+          AutomaticLogin=packer
+
+    - name: Enable gdm3
+      systemd:
+        name: gdm3
+        enabled: true
+        state: started
+
+    - name: Set DISPLAY globally
+      lineinfile:
+        path: /etc/environment
+        regexp: '^DISPLAY='
+        line: 'DISPLAY=:0'
+
+    - name: Ensure networkd-wait-online override directory exists
+      file:
+        path: /etc/systemd/system/systemd-networkd-wait-online.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Add override configuration for systemd-networkd-wait-online
+      copy:
+        dest: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/lib/systemd/systemd-networkd-wait-online --any --timeout=10

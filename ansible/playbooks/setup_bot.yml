@@ -1,0 +1,236 @@
+---
+# Replace the image-default packer user with bot.
+# Copies packer's groups and sudoers, writes a password and ed25519
+# keypair to .machines/<inventory_hostname>/ on the control host,
+# then disables SSH password login and deletes packer.
+#
+# Safe to re-run: existing local creds, bot user, sudoers, sshd config,
+# and the absence of packer are left alone.
+- name: Create bot user and local credentials
+  hosts: all
+  become: true
+  vars:
+    src_user: packer
+    dest_user: bot
+    project_root: "{{ playbook_dir | dirname | dirname }}"
+    machines_dir: "{{ project_root }}/.machines/{{ inventory_hostname }}"
+
+  handlers:
+    - name: Restart ssh
+      systemd:
+        name: ssh
+        state: restarted
+
+  tasks:
+    - name: Ensure local machines directory exists
+      file:
+        path: "{{ machines_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Check for existing password file
+      stat:
+        path: "{{ machines_dir }}/password.yml"
+      register: pwfile
+      delegate_to: localhost
+      become: false
+
+    - name: Load existing credentials
+      slurp:
+        src: "{{ machines_dir }}/password.yml"
+      register: pw_slurp
+      delegate_to: localhost
+      become: false
+      when: pwfile.stat.exists
+
+    - name: Parse existing credentials
+      set_fact:
+        parsed_creds: "{{ pw_slurp.content | b64decode | from_yaml }}"
+      no_log: true
+      when: pwfile.stat.exists
+
+    - name: Use stored password
+      set_fact:
+        bot_password: "{{ parsed_creds.password }}"
+      no_log: true
+      when: pwfile.stat.exists
+
+    - name: Generate a safe password for bot
+      set_fact:
+        bot_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      no_log: true
+      when: not pwfile.stat.exists
+
+    - name: Write username/password pair
+      copy:
+        dest: "{{ machines_dir }}/password.yml"
+        content: |
+          username: {{ dest_user }}
+          password: {{ bot_password }}
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+    - name: Generate ed25519 keypair
+      command: ssh-keygen -t ed25519 -N '' -f {{ machines_dir }}/id_ed25519 -C bot@{{ inventory_hostname }}
+      args:
+        creates: "{{ machines_dir }}/id_ed25519"
+      delegate_to: localhost
+      become: false
+
+    - name: Lock down private key
+      file:
+        path: "{{ machines_dir }}/id_ed25519"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+    - name: Check if packer user exists
+      command: id -u {{ src_user }}
+      register: packer_id
+      failed_when: false
+      changed_when: false
+
+    - name: Check if bot user exists
+      command: id -u {{ dest_user }}
+      register: dest_id
+      failed_when: false
+      changed_when: false
+
+    - name: Get packer groups
+      command: id -nG {{ src_user }}
+      register: packer_groups
+      changed_when: false
+      when: packer_id.rc == 0
+
+    - name: Get packer passwd entry
+      command: getent passwd {{ src_user }}
+      register: packer_passwd
+      changed_when: false
+      when: packer_id.rc == 0
+
+    - name: Inherit groups and shell from packer
+      set_fact:
+        bot_groups: "{{ packer_groups.stdout.split() | reject('equalto', src_user) | list }}"
+        bot_shell: "{{ packer_passwd.stdout.split(':')[6] }}"
+      when: packer_id.rc == 0
+
+    - name: Default groups and shell for a new bot
+      set_fact:
+        bot_groups: [sudo]
+        bot_shell: /bin/bash
+      when:
+        - packer_id.rc != 0
+        - dest_id.rc != 0
+
+    - name: Check for packer sudoers drop-in
+      stat:
+        path: /etc/sudoers.d/{{ src_user }}
+      register: packer_sudoers
+      when: packer_id.rc == 0
+
+    - name: Read packer sudoers drop-in
+      slurp:
+        src: /etc/sudoers.d/{{ src_user }}
+      register: packer_sudoers_content
+      when:
+        - packer_sudoers is defined
+        - packer_sudoers.stat.exists
+
+    - name: Check for bot sudoers drop-in
+      stat:
+        path: /etc/sudoers.d/{{ dest_user }}
+      register: bot_sudoers
+
+    - name: Create or update bot user
+      user:
+        name: "{{ dest_user }}"
+        groups: "{{ bot_groups | default(omit) }}"
+        append: "{{ dest_id.rc == 0 }}"
+        shell: "{{ bot_shell | default(omit) }}"
+        create_home: true
+        state: present
+
+    - name: Set bot password
+      user:
+        name: "{{ dest_user }}"
+        password: "{{ bot_password | password_hash('sha512') }}"
+      no_log: true
+      when: dest_id.rc != 0 or not pwfile.stat.exists
+
+    - name: Sudoers body from packer drop-in
+      set_fact:
+        bot_sudoers_body: "{{ packer_sudoers_content.content | b64decode | regex_replace(src_user, dest_user) }}"
+      when:
+        - packer_sudoers is defined
+        - packer_sudoers.stat.exists
+        - packer_sudoers_content is defined
+        - packer_sudoers_content.content is defined
+
+    - name: Default sudoers body
+      set_fact:
+        bot_sudoers_body: "{{ dest_user }} ALL=(ALL) NOPASSWD:ALL\n"
+      when:
+        - bot_sudoers_body is not defined
+        - not bot_sudoers.stat.exists
+
+    - name: Write bot sudoers
+      copy:
+        dest: /etc/sudoers.d/{{ dest_user }}
+        content: "{{ bot_sudoers_body }}"
+        mode: "0440"
+        validate: visudo -cf %s
+      when: bot_sudoers_body is defined
+
+    - name: Authorize bot key for SSH
+      authorized_key:
+        user: "{{ dest_user }}"
+        key: "{{ lookup('file', machines_dir + '/id_ed25519.pub') }}"
+        state: present
+
+    - name: Show local credential path
+      debug:
+        msg: "Credentials stored at {{ machines_dir }}"
+      delegate_to: localhost
+      become: false
+
+    # Inventory ansible_ssh_user=packer beats play vars. set_fact wins.
+    - name: Reconnect as bot
+      when: (ansible_user | default(ansible_ssh_user | default(''))) != dest_user
+      block:
+        - name: Switch remaining tasks to bot key auth
+          set_fact:
+            ansible_user: bot
+            ansible_ssh_user: bot
+            ansible_ssh_private_key_file: "{{ machines_dir }}/id_ed25519"
+            ansible_ssh_pass: ""
+            ansible_password: ""
+            ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o LogLevel=ERROR"
+
+        - name: Reset SSH connection as bot
+          meta: reset_connection
+
+    - name: Disable SSH password authentication
+      copy:
+        dest: /etc/ssh/sshd_config.d/99-disable-password-auth.conf
+        mode: "0644"
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+      notify: Restart ssh
+
+    - name: Remove packer sudoers drop-in
+      file:
+        path: /etc/sudoers.d/{{ src_user }}
+        state: absent
+
+    - name: Remove packer user
+      user:
+        name: "{{ src_user }}"
+        state: absent
+        remove: true
+        force: true
+      when: dest_user != src_user

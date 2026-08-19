@@ -1,0 +1,36 @@
+---
+- name: Install minimal GUI with autologin for packer user
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Install Xorg, openbox, and lightdm
+      apt:
+        name:
+          - xorg
+          - openbox
+          - lightdm
+        state: present
+        update_cache: yes
+
+    - name: Configure lightdm autologin for packer user
+      copy:
+        dest: /etc/lightdm/lightdm.conf
+        mode: "0644"
+        content: |
+          [Seat:*]
+          autologin-user=packer
+          autologin-user-timeout=0
+          user-session=openbox
+
+    - name: Enable and start lightdm
+      systemd:
+        name: lightdm
+        enabled: true
+        state: started
+
+    - name: Set DISPLAY globally
+      lineinfile:
+        path: /etc/environment
+        regexp: '^DISPLAY='
+        line: 'DISPLAY=:0'

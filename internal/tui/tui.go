@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/jaredeh/vmtool/internal/app"
 	"github.com/jaredeh/vmtool/pkg/vmtool"
 )
 
@@ -46,7 +48,7 @@ const (
 type fieldKind int
 
 const (
-	fieldText   fieldKind = iota
+	fieldText fieldKind = iota
 	fieldSelect
 )
 
@@ -62,7 +64,9 @@ type formField struct {
 const (
 	fName = iota
 	fImage
+	fPool
 	fDiskSize
+	fExtraDiskSize
 	fVCPUs
 	fMemory
 	fNetType
@@ -71,6 +75,7 @@ const (
 	fSSHUser
 	fSSHPass
 	fPlaybook
+	fNoclone
 	numCreateFields
 )
 
@@ -162,6 +167,11 @@ type cmdDoneMsg struct {
 	err    error
 }
 
+type sshDoneMsg struct {
+	name string
+	err  error
+}
+
 // createCtx carries state across chained create stages.
 type createCtx struct {
 	cfg          vmtool.VMConfig
@@ -187,7 +197,7 @@ type createStageMsg struct {
 	vms     []vmtool.VMInfo
 	err     error
 	// next stage
-	nextTitle string    // title for the next log entry (empty = no next stage)
+	nextTitle string                    // title for the next log entry (empty = no next stage)
 	nextFn    func(nextIdx int) tea.Msg // function for next stage
 }
 
@@ -201,6 +211,27 @@ func refresh(m *vmtool.Manager) tea.Cmd {
 func (m *model) addLog(title string) int {
 	m.log = append(m.log, logEntry{title: title, status: logStatusRunning})
 	return len(m.log) - 1
+}
+
+func (m model) svc() *app.Service {
+	return &app.Service{PlaybookDir: m.playbookDir, InventoryPath: m.inventoryPath}
+}
+
+func (m model) runLifecycle(op, name string, fn func(*app.Service, *vmtool.Manager) error) (tea.Model, tea.Cmd) {
+	idx := m.addLog(fmt.Sprintf("%s %s...", op, name))
+	mgr := m.manager
+	svc := m.svc()
+	return m, func() tea.Msg {
+		err := fn(svc, mgr)
+		title := fmt.Sprintf("%s %s", op, name)
+		status := logStatusDone
+		if err != nil {
+			title = fmt.Sprintf("%s %s: error: %v", op, name, err)
+			status = logStatusError
+		}
+		vms, listErr := mgr.List()
+		return cmdDoneMsg{logIdx: idx, title: title, status: status, vms: vms, err: listErr}
+	}
 }
 
 func initialModel(mgr *vmtool.Manager, playbookDir, inventoryPath string) model {
@@ -231,6 +262,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = len(m.vms) - 1
 		}
 		return m, nil
+
+	case sshDoneMsg:
+		if msg.err != nil {
+			idx := m.addLog(fmt.Sprintf("ssh %s: %v", msg.name, msg.err))
+			m.log[idx].status = logStatusError
+		}
+		return m, refresh(m.manager)
 
 	case cmdDoneMsg:
 		if msg.logIdx >= 0 && msg.logIdx < len(m.log) {
@@ -345,6 +383,10 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = modeOutput
 			}
 		}
+	case "t":
+		if m.focus == paneVMs && len(m.vms) > 0 {
+			return m.sshSelected()
+		}
 	case "r":
 		return m, refresh(m.manager)
 	case "c":
@@ -360,29 +402,19 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			vm := m.vms[m.cursor]
 			switch vm.State {
 			case vmtool.StateShutoff:
-				err := m.manager.Start(vm.Name)
-				if err != nil {
-					idx := m.addLog(fmt.Sprintf("start %s: error: %v", vm.Name, err))
-					m.log[idx].status = logStatusError
-				} else {
-					idx := m.addLog(fmt.Sprintf("started %s", vm.Name))
-					m.log[idx].status = logStatusDone
-				}
-				return m, refresh(m.manager)
+				return m.runLifecycle("start", vm.Name, func(svc *app.Service, mgr *vmtool.Manager) error {
+					_, err := svc.StartVM(context.Background(), mgr, vm.Name)
+					return err
+				})
 			case vmtool.StateRunning:
 				vmName := vm.Name
 				m.confirmMsg = fmt.Sprintf("Shut down %q?", vmName)
 				m.confirmAction = func() (tea.Model, tea.Cmd) {
-					err := m.manager.Stop(vmName)
-					if err != nil {
-						idx := m.addLog(fmt.Sprintf("stop %s: error: %v", vmName, err))
-						m.log[idx].status = logStatusError
-					} else {
-						idx := m.addLog(fmt.Sprintf("shutdown requested for %s", vmName))
-						m.log[idx].status = logStatusDone
-					}
 					m.mode = modeList
-					return m, refresh(m.manager)
+					return m.runLifecycle("stop", vmName, func(svc *app.Service, mgr *vmtool.Manager) error {
+						_, err := svc.StopVM(context.Background(), mgr, vmName)
+						return err
+					})
 				}
 				m.mode = modeConfirm
 			}
@@ -391,19 +423,17 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focus == paneVMs && len(m.vms) > 0 {
 			vm := m.vms[m.cursor]
 			newState := !vm.Autostart
-			err := m.manager.SetAutostart(vm.Name, newState)
-			if err != nil {
-				idx := m.addLog(fmt.Sprintf("autostart %s: error: %v", vm.Name, err))
-				m.log[idx].status = logStatusError
-			} else {
-				label := "enabled"
-				if !newState {
-					label = "disabled"
-				}
-				idx := m.addLog(fmt.Sprintf("autostart %s for %s", label, vm.Name))
-				m.log[idx].status = logStatusDone
+			label := "enable"
+			if !newState {
+				label = "disable"
 			}
-			return m, refresh(m.manager)
+			return m.runLifecycle("autostart", vm.Name, func(svc *app.Service, mgr *vmtool.Manager) error {
+				_, err := svc.SetAutostart(context.Background(), mgr, vm.Name, newState)
+				if err == nil {
+					_ = label
+				}
+				return err
+			})
 		}
 	case "D":
 		if m.focus == paneVMs && len(m.vms) > 0 {
@@ -411,21 +441,34 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			vmName := vm.Name
 			m.confirmMsg = fmt.Sprintf("Delete %q? This will destroy the VM and remove its disk.", vmName)
 			m.confirmAction = func() (tea.Model, tea.Cmd) {
-				err := m.manager.Delete(vmName, false)
-				if err != nil {
-					idx := m.addLog(fmt.Sprintf("delete %s: error: %v", vmName, err))
-					m.log[idx].status = logStatusError
-				} else {
-					idx := m.addLog(fmt.Sprintf("deleted %s", vmName))
-					m.log[idx].status = logStatusDone
-				}
 				m.mode = modeList
-				return m, refresh(m.manager)
+				return m.runLifecycle("delete", vmName, func(svc *app.Service, mgr *vmtool.Manager) error {
+					return svc.DeleteVM(context.Background(), mgr, vmName, false)
+				})
 			}
 			m.mode = modeConfirm
 		}
 	}
 	return m, nil
+}
+
+func (m model) sshSelected() (tea.Model, tea.Cmd) {
+	vm := m.vms[m.cursor]
+	if vm.State != vmtool.StateRunning || vm.IP == "" {
+		idx := m.addLog(fmt.Sprintf("ssh %s: no IP", vm.Name))
+		m.log[idx].status = logStatusError
+		return m, nil
+	}
+	cmd, err := vmtool.SSHCmd(vm.IP, vm.Name)
+	if err != nil {
+		idx := m.addLog(fmt.Sprintf("ssh %s: %v", vm.Name, err))
+		m.log[idx].status = logStatusError
+		return m, nil
+	}
+	name := vm.Name
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return sshDoneMsg{name: name, err: err}
+	})
 }
 
 // --- Confirm dialog ---
@@ -456,18 +499,30 @@ func (m model) enterCreateMode() (tea.Model, tea.Cmd) {
 	bridges, _ := m.manager.ListBridges()
 	nics, _ := vmtool.ListPhysicalNICs()
 
+	poolInfos, _ := m.manager.ListPools()
+	pools := make([]string, 0, len(poolInfos))
+	for _, p := range poolInfos {
+		pools = append(pools, p.Name)
+	}
+	if len(pools) == 0 {
+		pools = []string{"default"}
+	}
+
 	fields := []formField{
 		{label: "Name", kind: fieldText},
 		{label: "Image", kind: fieldSelect, options: images},
+		{label: "Pool", kind: fieldSelect, options: pools},
 		{label: "Disk size (GB)", def: "default", kind: fieldText},
+		{label: "Extra disk (GB)", def: "none", kind: fieldText},
 		{label: "VCPUs", def: "2", kind: fieldText},
-		{label: "Memory (MiB)", def: "2048", kind: fieldText},
+		{label: "Memory (GiB)", def: "2", kind: fieldText},
 		{label: "Net type", kind: fieldSelect, options: []string{"nat", "bridge", "direct"}},
 		{label: "Net source", kind: fieldSelect, options: networks},
 		{label: "Macvtap mode", kind: fieldSelect, options: []string{"bridge", "vepa", "private", "passthrough"}, hidden: true},
 		{label: "SSH user", def: "packer", kind: fieldText},
 		{label: "SSH pass", def: "packer", kind: fieldText},
 		{label: "Playbook", kind: fieldSelect, options: pbOptions},
+		{label: "Noclone", kind: fieldSelect, options: []string{"false", "true"}},
 	}
 
 	values := make([]string, len(fields))
@@ -476,6 +531,12 @@ func (m model) enterCreateMode() (tea.Model, tea.Cmd) {
 			values[i] = f.options[0]
 		} else {
 			values[i] = f.def
+		}
+	}
+	for _, p := range pools {
+		if p == "default" {
+			values[fPool] = "default"
+			break
 		}
 	}
 
@@ -617,14 +678,6 @@ func (m model) submitCreate() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	diskPath, err := m.manager.ImagePath(image)
-	if err != nil {
-		idx := m.addLog(fmt.Sprintf("create %s: %v", name, err))
-		m.log[idx].status = logStatusError
-		m.mode = modeList
-		return m, nil
-	}
-
 	var diskSizeGB uint
 	diskSizeStr := strings.TrimSpace(m.formValues[fDiskSize])
 	if diskSizeStr != "" && diskSizeStr != "default" {
@@ -635,50 +688,71 @@ func (m model) submitCreate() (tea.Model, tea.Cmd) {
 		diskSizeGB = uint(ds)
 	}
 
+	var extraDiskSizeGB uint
+	extraDiskStr := strings.TrimSpace(m.formValues[fExtraDiskSize])
+	if extraDiskStr != "" && extraDiskStr != "none" && extraDiskStr != "0" {
+		eds, err := strconv.ParseUint(extraDiskStr, 10, 32)
+		if err != nil || eds == 0 {
+			return m, nil
+		}
+		extraDiskSizeGB = uint(eds)
+	}
+
 	vcpus, _ := strconv.ParseUint(strings.TrimSpace(m.formValues[fVCPUs]), 10, 32)
-	if vcpus == 0 {
-		vcpus = 2
-	}
 	mem, _ := strconv.ParseUint(strings.TrimSpace(m.formValues[fMemory]), 10, 32)
-	if mem == 0 {
-		mem = 2048
-	}
-
-	netType := m.formValues[fNetType]
-	netSource := strings.TrimSpace(m.formValues[fNetSource])
-	sshUser := strings.TrimSpace(m.formValues[fSSHUser])
-	sshPass := strings.TrimSpace(m.formValues[fSSHPass])
 	playbookName := m.formValues[fPlaybook]
-
-	cfg := vmtool.VMConfig{
-		Name:       name,
-		VCPUs:      uint(vcpus),
-		MemoryMiB:  uint(mem),
-		DiskPath:   diskPath,
-		DiskSizeGB: diskSizeGB,
-		Network: vmtool.NetworkConfig{
-			Type:        vmtool.NetworkType(netType),
-			Source:      netSource,
-			MacvtapMode: vmtool.MacvtapMode(m.formValues[fMacvtapMode]),
-		},
-		SSHUser: sshUser,
-		SSHPass: sshPass,
+	if playbookName == "(none)" {
+		playbookName = ""
 	}
 
-	ctx := createCtx{
-		cfg:          cfg,
-		playbookName: playbookName,
-		sshUser:      sshUser,
-		sshPass:      sshPass,
-		invPath:      m.inventoryPath,
-		pbDir:        m.playbookDir,
+	in := app.CreateVMInput{
+		Name:        name,
+		Image:       image,
+		VCPUs:       uint(vcpus),
+		Memory:      uint(mem),
+		DiskSizeGB:  diskSizeGB,
+		Pool:        strings.TrimSpace(m.formValues[fPool]),
+		NetType:     m.formValues[fNetType],
+		NetSource:   strings.TrimSpace(m.formValues[fNetSource]),
+		MacvtapMode: m.formValues[fMacvtapMode],
+		SSHUser:     strings.TrimSpace(m.formValues[fSSHUser]),
+		SSHPass:     strings.TrimSpace(m.formValues[fSSHPass]),
+		Playbook:        playbookName,
+		Noclone:         m.formValues[fNoclone] == "true",
+		ExtraDiskSizeGB: extraDiskSizeGB,
 	}
 
-	logIdx := m.addLog(fmt.Sprintf("cloning %s from %s...", name, image))
+	logIdx := m.addLog(fmt.Sprintf("creating %s...", name))
 	m.mode = modeList
 	mgr := m.manager
+	svc := m.svc()
 	return m, func() tea.Msg {
-		return stageClone(mgr, ctx, logIdx)
+		var buf strings.Builder
+		in.OnProgress = func(ev app.ProgressEvent) {
+			if ev.Output != "" {
+				buf.WriteString(ev.Output)
+			}
+			if ev.Detail != "" && (ev.Status == "done" || ev.Status == "error") {
+				buf.WriteString(ev.Detail)
+				buf.WriteByte('\n')
+			}
+		}
+		info, err := svc.CreateVM(context.Background(), mgr, in)
+		title := fmt.Sprintf("%s: created", name)
+		status := logStatusDone
+		if info != nil && info.IP != "" {
+			title = fmt.Sprintf("%s: IP %s", name, info.IP)
+		}
+		if err != nil {
+			title = fmt.Sprintf("%s: error: %v", name, err)
+			status = logStatusError
+			var ae *app.Error
+			if app.AsError(err, &ae) && ae.Output != "" {
+				buf.WriteString(ae.Output)
+			}
+		}
+		vms, listErr := mgr.List()
+		return cmdDoneMsg{logIdx: logIdx, title: title, status: status, output: buf.String(), vms: vms, err: listErr}
 	}
 }
 
@@ -771,7 +845,7 @@ func stageWaitIP(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg {
 		}
 	}
 	ctx.ip = ip
-	_ = vmtool.WriteInventory(ctx.invPath, ip, ctx.sshUser, ctx.sshPass)
+	_ = vmtool.WriteInventory(ctx.invPath, name, ip, vmtool.Auth{User: ctx.sshUser, Password: ctx.sshPass})
 
 	vms, _ := mgr.List()
 	msg := createStageMsg{
@@ -814,7 +888,7 @@ func stageGrowPartition(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg 
 func stagePlaybook(mgr *vmtool.Manager, ctx createCtx, logIdx int) tea.Msg {
 	name := ctx.cfg.Name
 	playbookPath := filepath.Join(ctx.pbDir, ctx.playbookName)
-	out, err := vmtool.RunPlaybook(ctx.invPath, playbookPath)
+	out, err := vmtool.RunPlaybook(ctx.invPath, playbookPath, map[string]string{"deviceid": name})
 
 	if err != nil {
 		return createStageMsg{
@@ -1101,30 +1175,21 @@ func (m model) runPlaybook() (tea.Model, tea.Cmd) {
 
 	mgr := m.manager
 	vmName := vm.Name
-	vmIP := vm.IP
-	invPath := m.inventoryPath
-	pbDir := m.playbookDir
+	svc := m.svc()
 	return m, func() tea.Msg {
-		_, _ = vmtool.EnsureInventory(invPath, vmIP, "packer", "packer")
-
-		playbookPath := filepath.Join(pbDir, pb)
-		out, err := vmtool.RunPlaybook(invPath, playbookPath)
+		res, err := svc.RunPlaybook(context.Background(), mgr, vmName, pb, vmtool.DefaultAuth(), nil)
+		out := ""
+		if res != nil {
+			out = res.Output
+		}
 		status := logStatusDone
 		title := fmt.Sprintf("%s on %s: done", pb, vmName)
 		if err != nil {
 			status = logStatusError
 			title = fmt.Sprintf("%s on %s: error: %v", pb, vmName, err)
 		}
-
 		vms, listErr := mgr.List()
-		return cmdDoneMsg{
-			logIdx: logIdx,
-			title:  title,
-			status: status,
-			output: out,
-			vms:    vms,
-			err:    listErr,
-		}
+		return cmdDoneMsg{logIdx: logIdx, title: title, status: status, output: out, vms: vms, err: listErr}
 	}
 }
 
@@ -1202,7 +1267,7 @@ func (m model) View() string {
 				autostart = "on"
 			}
 			line := fmt.Sprintf("  %-20s %-10s %-6d %-10s %-11s %s",
-				vm.Name, vm.State, vm.VCPUs, fmt.Sprintf("%d MiB", vm.MemoryMiB), autostart, ip)
+				vm.Name, vm.State, vm.VCPUs, fmt.Sprintf("%d GiB", vm.Memory), autostart, ip)
 
 			if i == m.cursor && vmFocus {
 				b.WriteString(selectedStyle.Render("> " + line[2:]))
@@ -1280,7 +1345,7 @@ func (m model) View() string {
 
 	b.WriteString("\n")
 	if m.focus == paneVMs {
-		b.WriteString(helpStyle.Render("c=create  s=start/stop  a=autostart  p=playbook  D=delete  r=refresh  tab=log  q=quit"))
+		b.WriteString(helpStyle.Render("c=create  s=start/stop  a=autostart  p=playbook  t=ssh  D=delete  r=refresh  tab=log  q=quit"))
 	} else {
 		b.WriteString(helpStyle.Render("enter=view output  tab=vms  q=quit"))
 	}

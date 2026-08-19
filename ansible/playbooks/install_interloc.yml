@@ -1,0 +1,108 @@
+---
+# Install the latest interloc debs from the published agent directory.
+# Picks the newest .deb per package (by listing mtime) for this host's arch.
+#
+# Optional extra-vars (needed for the daemon to stay up):
+#   interloc_hub_url: wss://agents.bitflux.ai
+#   interloc_register_token: <from admin UI>
+- name: Install interloc
+  hosts: all
+  become: true
+  vars:
+    interloc_deb_index_url: https://agents.resurgentech.com/debs/
+    interloc_deb_dir: /tmp/interloc-debs
+    interloc_deb_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_architecture, ansible_architecture) }}"
+    interloc_hub_url: ""
+    interloc_register_token: ""
+
+  tasks:
+    - name: Install ca-certificates
+      apt:
+        name: ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Fetch interloc deb directory listing
+      uri:
+        url: "{{ interloc_deb_index_url }}"
+        return_content: yes
+      register: interloc_index
+
+    - name: Create temp dir for debs
+      file:
+        path: "{{ interloc_deb_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write listing to parse
+      copy:
+        dest: "{{ interloc_deb_dir }}/index.html"
+        content: "{{ interloc_index.content }}"
+        mode: "0644"
+
+    - name: Select latest .deb per package
+      command:
+        argv:
+          - python3
+          - -c
+          - |
+            import re, sys
+            html = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+            want_arch = sys.argv[2]
+            rows = []
+            for m in re.finditer(r'<tr class="file">(.*?)</tr>', html, re.S):
+                row = m.group(1)
+                name_m = re.search(r'class="name">([^<]+\.deb)', row)
+                href_m = re.search(r'href="\./?([^"]+\.deb)"', row)
+                name = name_m.group(1) if name_m else (href_m.group(1) if href_m else "")
+                if not name:
+                    continue
+                ts_m = re.search(r'datetime="([^"]+)"', row)
+                ts = ts_m.group(1) if ts_m else ""
+                parts = name[:-4].rsplit("_", 2)
+                if len(parts) != 3:
+                    continue
+                pkg, ver, arch = parts
+                if arch != want_arch:
+                    continue
+                rows.append((pkg, ts, ver, name))
+            if not rows:
+                sys.stderr.write("no .deb files for arch %s at listing\n" % want_arch)
+                sys.exit(1)
+            best = {}
+            for pkg, ts, ver, name in rows:
+                prev = best.get(pkg)
+                if prev is None or (ts, ver) > (prev[0], prev[1]):
+                    best[pkg] = (ts, ver, name)
+            for _, _, name in sorted(best.values(), key=lambda item: item[2]):
+                print(name)
+          - "{{ interloc_deb_dir }}/index.html"
+          - "{{ interloc_deb_arch }}"
+      register: interloc_latest
+      changed_when: false
+
+    - name: Collect latest .deb filenames
+      set_fact:
+        interloc_debs: "{{ interloc_latest.stdout_lines }}"
+
+    - name: Fail if no debs selected
+      fail:
+        msg: "No .deb files found for {{ interloc_deb_arch }} at {{ interloc_deb_index_url }}"
+      when: interloc_debs | length == 0
+
+    - name: Download latest interloc debs
+      get_url:
+        url: "{{ interloc_deb_index_url }}{{ item | urlencode }}"
+        dest: "{{ interloc_deb_dir }}/{{ item }}"
+        mode: "0644"
+      loop: "{{ interloc_debs }}"
+
+    - name: Install interloc debs
+      apt:
+        deb: "{{ interloc_deb_dir }}/{{ item }}"
+      loop: "{{ interloc_debs }}"
+
+    - name: Remove downloaded debs
+      file:
+        path: "{{ interloc_deb_dir }}"
+        state: absent

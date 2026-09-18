@@ -43,9 +43,19 @@ build {
     destination = "/tmp/99-wildcard.yaml"
   }
 
+  # The wildcard netplan is what makes the image portable: packer attaches the
+  # NIC straight to pcie.0 (ens3), libvirt puts it behind a pcie-root-port
+  # (enp1s0), so a config naming one interface is dead on the other host.
+  #
+  # Deleting 50-cloud-init.yaml is not enough — cloud-init rewrites it on every
+  # boot from subiquity's 90-installer-network.cfg, which hardcodes ens3. Drop
+  # that file and turn cloud-init's network layer off so 99-wildcard.yaml is the
+  # only thing that ever configures the guest NIC.
   provisioner "shell" {
     inline = [
       "sudo rm -f /etc/netplan/50-cloud-init.yaml",
+      "sudo rm -f /etc/cloud/cloud.cfg.d/90-installer-network.cfg",
+      "printf 'network: {config: disabled}\\n' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
       "sudo cp /tmp/99-wildcard.yaml /etc/netplan/99-wildcard.yaml",
       "sudo chmod 600 /etc/netplan/99-wildcard.yaml",
     ]

@@ -228,7 +228,8 @@ for COMMAND in "${COMMANDS[@]}"; do
       run_command "packer init ."
       run_command "packer build ."
       run_command "sudo cp ${PKR_VAR_output_directory}/${PKR_VAR_distro} /var/lib/libvirt/images/${PKR_VAR_distro}.qcow2"
-      run_command "virsh pool-refresh default"
+      # vmtool uses qemu:///system; bare virsh is qemu:///session unless $USER is in libvirt.
+      run_command "virsh -c qemu:///system pool-refresh default"
       ;;
     *)
       echo "command '$COMMAND' not implemented"

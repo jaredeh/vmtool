@@ -1,0 +1,363 @@
+---
+# Prepare a machine to *run* vmtool: packages, libvirt daemon, group membership,
+# and the libvirt "default" network and storage pool that vmtool assumes exist.
+#
+#   ansible-playbook ansible/playbooks/setup_host.yml -K
+#   ansible-playbook ansible/playbooks/setup_host.yml -K -e vmtool_install_go=true
+#   ansible-playbook ansible/playbooks/setup_host.yml -K \
+#     -e '{"vmtool_extra_pools":[{"name":"fast","path":"/srv/vms"}]}'
+#
+# Supports Ubuntu/Debian and Omarchy/Arch. Safe to re-run.
+- name: Install vmtool host prerequisites
+  hosts: "{{ vmtool_hosts | default('localhost') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    # Account that will run vmtool; it is what gets added to the libvirt group.
+    vmtool_user: "{{ ansible_facts.env.SUDO_USER | default(ansible_facts.user_id, true) }}"
+
+    # Path backing the libvirt "default" dir pool. vmtool clones images here.
+    vmtool_pool_path: /var/lib/libvirt/images
+
+    # Additional dir pools: [{name: fast, path: /srv/vms}, ...]
+    vmtool_extra_pools: []
+
+    # Drop /etc/profile.d/vmtool.sh so bare `virsh` matches vmtool (qemu:///system).
+    vmtool_set_default_uri: true
+
+    # Open DHCP/DNS and forwarding for the guest bridge when ufw is active.
+    # Without this, guests boot with no IP on a default-deny host.
+    vmtool_configure_firewall: true
+    vmtool_bridge: virbr0
+
+    # Off by default: distro Go is often older than the 1.24 vmtool needs.
+    vmtool_install_go: false
+
+    # Extras for packer_images/run (image building), not for running vmtool.
+    vmtool_install_packer_deps: false
+
+    # Set false on a host without hardware virtualization.
+    vmtool_require_kvm: true
+
+    vmtool_packages_debian:
+      - qemu-kvm
+      - qemu-utils
+      - libvirt-daemon-system
+      - libvirt-clients
+      - libvirt-dev          # C headers for the Go bindings
+      - pkg-config           # cgo needs it to find libvirt
+      - dnsmasq-base         # DHCP/DNS for the default NAT network
+      - bridge-utils
+      - ansible              # vmtool shells out to ansible-playbook
+      - sshpass              # vmtool shells out to sshpass for password SSH
+      - openssh-client
+
+    vmtool_packages_arch:
+      - libvirt              # daemon and headers are one package on Arch
+      - pkgconf
+      - qemu-desktop         # qemu-full only adds non-x86 targets
+      - dnsmasq
+      - iptables-nft         # optional dep of libvirt the NAT network needs
+      - ansible
+      - sshpass
+      - openssh
+
+    vmtool_packages_go_debian: [golang-go]
+    vmtool_packages_go_arch: [go]
+    vmtool_packages_packer_debian: [gettext-base, openssl]
+    vmtool_packages_packer_arch: [gettext, openssl, packer]
+
+    # Matches Manager.EnsureDefaultNetwork in pkg/vmtool/libvirt.go.
+    vmtool_network_xml: |
+      <network>
+        <name>default</name>
+        <forward mode='nat'>
+          <nat>
+            <port start='1024' end='65535'/>
+          </nat>
+        </forward>
+        <bridge name='virbr0' stp='on' delay='0'/>
+        <ip address='192.168.122.1' netmask='255.255.255.0'>
+          <dhcp>
+            <range start='192.168.122.2' end='192.168.122.254'/>
+          </dhcp>
+        </ip>
+      </network>
+
+  tasks:
+
+    # ---------------------------------------------------------------- preflight
+
+    # Omarchy reports as Archlinux via /etc/arch-release, but derivatives that
+    # ship neither that file nor a known ID still carry ID_LIKE=arch.
+    - name: Read /etc/os-release
+      ansible.builtin.slurp:
+        src: /etc/os-release
+      register: vmtool_os_release
+
+    - name: Classify the package family
+      ansible.builtin.set_fact:
+        vmtool_family: >-
+          {%- if ansible_facts.os_family == 'Debian' or 'debian' in _like or 'ubuntu' in _like
+                 or _id in ['debian', 'ubuntu'] -%}
+          debian
+          {%- elif ansible_facts.os_family == 'Archlinux' or 'arch' in _like or _id == 'arch' -%}
+          arch
+          {%- else -%}
+          unsupported
+          {%- endif -%}
+      vars:
+        _osr: "{{ vmtool_os_release.content | b64decode }}"
+        _lines: "{{ _osr.splitlines() }}"
+        _id: "{{ (_lines | select('match', 'ID=') | first | default('ID=')).split('=', 1)[1] | replace('\"', '') }}"
+        _like: "{{ (_lines | select('match', 'ID_LIKE=') | first | default('ID_LIKE=')).split('=', 1)[1] | replace('\"', '') }}"
+
+    - name: Fail on an unsupported distribution
+      ansible.builtin.fail:
+        msg: >-
+          {{ ansible_facts.distribution }} is not supported by this playbook
+          (Ubuntu/Debian and Omarchy/Arch only).
+      when: vmtool_family == 'unsupported'
+
+    - name: Check for /dev/kvm
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: vmtool_kvm
+
+    - name: Fail when hardware virtualization is unavailable
+      ansible.builtin.fail:
+        msg: >-
+          /dev/kvm is missing. Enable VT-x/AMD-V in firmware, or re-run with
+          -e vmtool_require_kvm=false to continue without it.
+      when:
+        - vmtool_require_kvm | bool
+        - not vmtool_kvm.stat.exists
+
+    - name: Require a non-root vmtool user
+      ansible.builtin.fail:
+        msg: "Could not determine the vmtool user; pass -e vmtool_user=<name>."
+      when: vmtool_user | default('', true) in ['', 'root']
+
+    # ---------------------------------------------------------------- packages
+
+    - name: Build the package list
+      ansible.builtin.set_fact:
+        vmtool_packages: "{{ _base + _go + _packer }}"
+      vars:
+        _debian: "{{ vmtool_family == 'debian' }}"
+        _base: "{{ _debian | ternary(vmtool_packages_debian, vmtool_packages_arch) }}"
+        _go: "{{ (vmtool_install_go | bool)
+                 | ternary(_debian | ternary(vmtool_packages_go_debian, vmtool_packages_go_arch), []) }}"
+        _packer: "{{ (vmtool_install_packer_deps | bool)
+                     | ternary(_debian | ternary(vmtool_packages_packer_debian,
+                                                 vmtool_packages_packer_arch), []) }}"
+
+    - name: Install packages (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: "{{ vmtool_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: vmtool_family == 'debian'
+
+    # pacman lives in community.general, which ansible-core alone does not ship,
+    # so drive it directly. `pacman -T` prints only what is missing, which keeps
+    # this idempotent without changed_when guesswork.
+    - name: Find missing packages (Arch/Omarchy)
+      ansible.builtin.command:
+        argv: "{{ ['pacman', '-T'] + vmtool_packages }}"
+      register: vmtool_pacman_missing
+      changed_when: false
+      check_mode: false
+      failed_when: vmtool_pacman_missing.rc not in [0, 127]
+      when: vmtool_family == 'arch'
+
+    - name: Install packages (Arch/Omarchy)
+      ansible.builtin.command:
+        argv: "{{ ['pacman', '-S', '--needed', '--noconfirm'] + vmtool_pacman_missing.stdout_lines }}"
+      when:
+        - vmtool_family == 'arch'
+        - vmtool_pacman_missing.stdout_lines | default([]) | length > 0
+
+    - name: Note that packer is not packaged for Debian/Ubuntu
+      ansible.builtin.debug:
+        msg: >-
+          packer is not in the Debian/Ubuntu archive. Add HashiCorp's apt repo
+          (https://developer.hashicorp.com/packer/install) before using
+          packer_images/run.
+      when:
+        - vmtool_install_packer_deps | bool
+        - vmtool_family == 'debian'
+
+    # ------------------------------------------------------------------ daemon
+
+    - name: List installed systemd units
+      ansible.builtin.command: systemctl list-unit-files --no-legend --no-pager
+      register: vmtool_units
+      changed_when: false
+      check_mode: false
+
+    # Both distros socket-activate libvirtd; the .service unit is only touched
+    # where it exists, so this survives libvirt's modular-daemon layouts.
+    - name: Enable and start libvirt units
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - libvirtd.socket
+        - libvirtd-ro.socket
+        - virtlogd.socket
+        - libvirtd.service
+      when: vmtool_units.stdout is search('^' ~ (item | regex_escape), multiline=True)
+
+    - name: Wait for the system libvirt socket
+      ansible.builtin.command: virsh -c qemu:///system version
+      register: vmtool_virsh
+      changed_when: false
+      check_mode: false
+      retries: 10
+      delay: 2
+      until: vmtool_virsh.rc == 0
+
+    # ------------------------------------------------------------------- users
+
+    - name: Ensure the libvirt group exists
+      ansible.builtin.group:
+        name: libvirt
+        state: present
+
+    # kvm only exists once qemu is installed, and not on every distro.
+    - name: Look for a kvm group
+      ansible.builtin.getent:
+        database: group
+        key: kvm
+        fail_key: false
+
+    - name: Add "{{ vmtool_user }}" to the libvirt group
+      ansible.builtin.user:
+        name: "{{ vmtool_user }}"
+        groups: "{{ ['libvirt'] + (['kvm'] if _kvm_group is not none else []) }}"
+      vars:
+        _kvm_group: "{{ ansible_facts.getent_group.kvm | default(none, true) }}"
+        append: true
+      register: vmtool_groups
+
+    - name: Point bare virsh at qemu:///system
+      ansible.builtin.copy:
+        dest: /etc/profile.d/vmtool.sh
+        mode: "0644"
+        content: |
+          # Managed by ansible/playbooks/setup_host.yml
+          # vmtool always uses qemu:///system; make virsh agree.
+          export LIBVIRT_DEFAULT_URI=qemu:///system
+      when: vmtool_set_default_uri | bool
+
+    # ----------------------------------------------------------------- network
+
+    - name: Inspect the default network
+      ansible.builtin.command: virsh -c qemu:///system net-info default
+      register: vmtool_net_info
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Define the default network
+      when: vmtool_net_info.rc != 0
+      block:
+        - name: Stage the default network XML
+          ansible.builtin.copy:
+            dest: /tmp/vmtool-default-net.xml
+            content: "{{ vmtool_network_xml }}"
+            mode: "0600"
+
+        - name: Register the default network with libvirt
+          ansible.builtin.command: virsh -c qemu:///system net-define /tmp/vmtool-default-net.xml
+      always:
+        - name: Remove the staged network XML
+          ansible.builtin.file:
+            path: /tmp/vmtool-default-net.xml
+            state: absent
+
+    - name: Autostart the default network
+      ansible.builtin.command: virsh -c qemu:///system net-autostart default
+      when: vmtool_net_info.rc != 0 or vmtool_net_info.stdout is search('Autostart:\s+no')
+
+    - name: Start the default network
+      ansible.builtin.command: virsh -c qemu:///system net-start default
+      when: vmtool_net_info.rc != 0 or vmtool_net_info.stdout is search('Active:\s+no')
+
+    # ---------------------------------------------------------------- firewall
+
+    # ufw defaults to deny-incoming and deny-routed, which silently kills the
+    # guest's DHCP broadcast (ufw does not even log broadcasts at its default
+    # log level) and then its outbound NAT. libvirt's own nftables table cannot
+    # override this: at the same hook a drop in ufw's table wins. Omarchy ships
+    # ufw enabled, so a fresh vmtool host hits this as "VM never gets an IP".
+    - name: Check for an active ufw
+      ansible.builtin.command: ufw status
+      register: vmtool_ufw
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      when: vmtool_configure_firewall | bool
+
+    - name: Allow libvirt guest traffic through ufw
+      ansible.builtin.command: "ufw {{ item.rule }}"
+      register: vmtool_ufw_rule
+      changed_when: "'Skipping' not in vmtool_ufw_rule.stdout"
+      loop:
+        - rule: >-
+            allow in on {{ vmtool_bridge }} to any port 67 proto udp
+            comment 'vmtool libvirt DHCP'
+          label: dhcp
+        - rule: >-
+            allow in on {{ vmtool_bridge }} to any port 53
+            comment 'vmtool libvirt DNS'
+          label: dns
+        - rule: >-
+            route allow in on {{ vmtool_bridge }}
+            comment 'vmtool guests outbound'
+          label: route-in
+        - rule: >-
+            route allow out on {{ vmtool_bridge }}
+            comment 'vmtool guests inbound replies'
+          label: route-out
+      loop_control:
+        label: "{{ item.label }}"
+      when:
+        - vmtool_configure_firewall | bool
+        - vmtool_ufw.rc | default(1) == 0
+        - vmtool_ufw.stdout | default('') is search('Status:\s+active')
+
+    # ------------------------------------------------------------------- pools
+
+    - name: Ensure the default and extra storage pools
+      ansible.builtin.include_tasks: tasks/libvirt_pool.yml
+      loop: "{{ [{'name': 'default', 'path': vmtool_pool_path}] + vmtool_extra_pools }}"
+      loop_control:
+        loop_var: pool
+        label: "{{ pool.name }} ({{ pool.path }})"
+
+    # ----------------------------------------------------------------- summary
+
+    - name: Collect the resulting libvirt state
+      ansible.builtin.command: "virsh -c qemu:///system {{ item }}"
+      register: vmtool_state
+      changed_when: false
+      check_mode: false
+      loop:
+        - net-list --all
+        - pool-list --all
+
+    - name: Show the resulting libvirt state
+      ansible.builtin.debug:
+        msg: "{{ vmtool_state.results | map(attribute='stdout_lines') | flatten }}"
+
+    - name: Note the pending group membership
+      ansible.builtin.debug:
+        msg: >-
+          {{ vmtool_user }} was added to the libvirt group. Log out and back in
+          (or run `newgrp libvirt`) before using vmtool.
+      when: vmtool_groups is changed

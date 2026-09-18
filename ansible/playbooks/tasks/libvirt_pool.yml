@@ -1,0 +1,51 @@
+---
+# Define, build, start and autostart one dir-type libvirt storage pool.
+# Called from setup_host.yml with loop_var `pool` ({name: ..., path: ...}).
+# Mirrors Manager.CreatePool in pkg/vmtool/libvirt.go.
+
+- name: "Check {{ pool.path }}"
+  ansible.builtin.stat:
+    path: "{{ pool.path }}"
+  register: vmtool_pool_dir
+
+# Created only when absent: an existing directory keeps whatever ownership and
+# mode the distro or the admin gave it.
+- name: "Create {{ pool.path }}"
+  ansible.builtin.file:
+    path: "{{ pool.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+  when: not vmtool_pool_dir.stat.exists
+
+- name: "Inspect the {{ pool.name }} pool"
+  ansible.builtin.command: "virsh -c qemu:///system pool-info {{ pool.name }}"
+  register: vmtool_pool_info
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: "Define the {{ pool.name }} pool"
+  ansible.builtin.command: >-
+    virsh -c qemu:///system pool-define-as {{ pool.name }} dir
+    --target {{ pool.path }}
+  when: vmtool_pool_info.rc != 0
+
+- name: "Build the {{ pool.name }} pool"
+  ansible.builtin.command: "virsh -c qemu:///system pool-build {{ pool.name }}"
+  when: vmtool_pool_info.rc != 0
+
+- name: "Autostart the {{ pool.name }} pool"
+  ansible.builtin.command: "virsh -c qemu:///system pool-autostart {{ pool.name }}"
+  when: vmtool_pool_info.rc != 0 or vmtool_pool_info.stdout is search('Autostart:\s+no')
+
+- name: "Start the {{ pool.name }} pool"
+  ansible.builtin.command: "virsh -c qemu:///system pool-start {{ pool.name }}"
+  when: vmtool_pool_info.rc != 0 or vmtool_pool_info.stdout is search('State:\s+inactive')
+
+# vmtool lists images straight out of the pool, so pick up anything dropped
+# into the directory outside libvirt (packer output, manual copies).
+- name: "Refresh the {{ pool.name }} pool"
+  ansible.builtin.command: "virsh -c qemu:///system pool-refresh {{ pool.name }}"
+  changed_when: false

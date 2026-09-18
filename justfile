@@ -9,6 +9,10 @@ bin := "vmtool"
 default:
     @just --list
 
+# Install host prerequisites (packages, libvirt, default network + pool)
+prereqs *ARGS:
+    "{{ root }}/scripts/prereqs.sh" {{ ARGS }}
+
 # Build ./vmtool
 build:
     cd "{{ root }}" && go build -o {{ bin }} ./cmd/vmtool

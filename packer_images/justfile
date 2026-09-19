@@ -1,0 +1,49 @@
+# packer_images — build qcow2 VM images with packer and install them into libvirt.
+# Replaces ./run. Pass a template dir name from qemu_images/ (default: ubuntu2404).
+# Use `just --dry-run <recipe>` to print commands without running them.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+root := justfile_directory()
+images := root / "qemu_images"
+output := root / "output"
+vmtool := root / ".." / "vmtool"
+default_template := "ubuntu2404"
+
+# Consumed by packer (PKR_VAR_*) and by envsubst in user-data.tpl
+export PKR_VAR_username := "packer"
+export PKR_VAR_password := "packer"
+
+default:
+    @just --list
+
+# List available templates
+templates:
+    @ls -1 "{{ images }}"
+
+# Render user-data, packer build, install qcow2 into libvirt
+generate template=default_template: (_check-template template)
+    rm -rf "{{ output / template }}"
+    cd "{{ images / template / "http" }}" && PKR_VAR_distro="{{ template }}" PKR_VAR_hashedpassword="$(openssl passwd -6 "$PKR_VAR_password")" envsubst < user-data.tpl > user-data
+    cd "{{ images / template }}" && packer init .
+    cd "{{ images / template }}" && PKR_VAR_distro="{{ template }}" PKR_VAR_output_directory="{{ output / template }}" packer build .
+    sudo cp "{{ output / template / template }}" "/var/lib/libvirt/images/{{ template }}.qcow2"
+    # vmtool uses qemu:///system; bare virsh is qemu:///session unless $USER is in libvirt.
+    virsh -c qemu:///system pool-refresh default
+
+# Boot a throwaway VM from the installed image (vm_upgrade.yml step not wired up yet)
+update template=default_template: (_check-template template)
+    -"{{ vmtool }}" delete "{{ template }}-update" 2>/dev/null
+    "{{ vmtool }}" create --noclone "{{ template }}-update" "{{ template }}.qcow2"
+
+# Delete build output for one template
+clean template=default_template: (_check-template template)
+    rm -rf "{{ output / template }}"
+
+# Delete all build output
+distclean:
+    rm -rf "{{ output }}"
+
+[private]
+_check-template template:
+    @[[ -d "{{ images / template }}" ]] || { echo "Error: invalid template '{{ template }}'. Available:" >&2; ls -1 "{{ images }}" >&2; exit 1; }

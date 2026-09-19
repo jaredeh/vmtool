@@ -2,7 +2,8 @@
 # Replace the image-default packer user with bot.
 # Copies packer's groups and sudoers, writes a password and ed25519
 # keypair to .machines/<inventory_hostname>/ on the control host,
-# then disables SSH password login and deletes packer.
+# then disables SSH password login, moves GUI autologin (gdm3/lightdm)
+# to bot, and deletes packer.
 #
 # Safe to re-run: existing local creds, bot user, sudoers, sshd config,
 # and the absence of packer are left alone.
@@ -19,6 +20,16 @@
     - name: Restart ssh
       systemd:
         name: ssh
+        state: restarted
+
+    - name: Restart gdm3
+      systemd:
+        name: gdm3
+        state: restarted
+
+    - name: Restart lightdm
+      systemd:
+        name: lightdm
         state: restarted
 
   tasks:
@@ -136,8 +147,7 @@
         src: /etc/sudoers.d/{{ src_user }}
       register: packer_sudoers_content
       when:
-        - packer_sudoers is defined
-        - packer_sudoers.stat.exists
+        - packer_sudoers.stat.exists | default(false)
 
     - name: Check for bot sudoers drop-in
       stat:
@@ -148,7 +158,7 @@
       user:
         name: "{{ dest_user }}"
         groups: "{{ bot_groups | default(omit) }}"
-        append: "{{ dest_id.rc == 0 }}"
+        append: "{{ dest_id.rc == 0 and bot_groups is defined }}"
         shell: "{{ bot_shell | default(omit) }}"
         create_home: true
         state: present
@@ -164,8 +174,7 @@
       set_fact:
         bot_sudoers_body: "{{ packer_sudoers_content.content | b64decode | regex_replace(src_user, dest_user) }}"
       when:
-        - packer_sudoers is defined
-        - packer_sudoers.stat.exists
+        - packer_sudoers.stat.exists | default(false)
         - packer_sudoers_content is defined
         - packer_sudoers_content.content is defined
 
@@ -221,6 +230,50 @@
           KbdInteractiveAuthentication no
           PubkeyAuthentication yes
       notify: Restart ssh
+
+    # GUI images (install_gui.yml / install_minimal_gui.yml) autologin packer.
+    # Point whichever display manager is present at bot; headless VMs skip this.
+    - name: Check for gdm3 config
+      stat:
+        path: /etc/gdm3/custom.conf
+      register: gdm3_conf
+
+    - name: Check for lightdm config
+      stat:
+        path: /etc/lightdm/lightdm.conf
+      register: lightdm_conf
+
+    - name: Configure gdm3 autologin for bot
+      ini_file:
+        path: /etc/gdm3/custom.conf
+        section: daemon
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        no_extra_spaces: true
+        mode: "0644"
+      loop:
+        - { option: AutomaticLoginEnable, value: "True" }
+        - { option: AutomaticLogin, value: "{{ dest_user }}" }
+      when: gdm3_conf.stat.exists
+      notify: Restart gdm3
+
+    - name: Configure lightdm autologin for bot
+      ini_file:
+        path: /etc/lightdm/lightdm.conf
+        section: "Seat:*"
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        no_extra_spaces: true
+        mode: "0644"
+      loop:
+        - { option: autologin-user, value: "{{ dest_user }}" }
+        - { option: autologin-user-timeout, value: "0" }
+      when: lightdm_conf.stat.exists
+      notify: Restart lightdm
+
+    # End packer's desktop session and log bot in before deleting packer.
+    - name: Apply display manager changes
+      meta: flush_handlers
 
     - name: Remove packer sudoers drop-in
       file:

@@ -50,6 +50,11 @@ func (s *Service) CreateVM(_ context.Context, m Manager, in CreateVMInput) (*vmt
 	cfg.ExtraDiskPool = in.ExtraDiskPool
 
 	if !in.Noclone {
+		// A fresh clone only has image-default users; drop creds left by a
+		// previous VM of the same name.
+		if err := vmtool.ForgetMachine(cfg.Name); err != nil {
+			return nil, wrap("create", err)
+		}
 		emit(in, "clone", "start", "cloning image", "")
 		cloned, err := m.CloneImage(cfg.DiskPath, cfg.Name, cfg.Pool)
 		if err != nil {
@@ -109,6 +114,13 @@ func (s *Service) CreateVM(_ context.Context, m Manager, in CreateVMInput) (*vmt
 		return info, nil
 	}
 	emit(in, "wait_ip", "done", "IP "+ip, "")
+
+	// DHCP may hand out an IP a previous VM had; its creds don't apply here.
+	if !in.Noclone {
+		if err := vmtool.ForgetMachine(ip); err != nil {
+			return info, wrap("create", err)
+		}
+	}
 
 	auth := vmtool.ResolveAuth(ip, cfg.Name, vmtool.Auth{User: cfg.SSHUser, Password: cfg.SSHPass})
 	if s.InventoryPath != "" {

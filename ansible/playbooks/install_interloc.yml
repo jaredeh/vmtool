@@ -14,6 +14,12 @@
     interloc_deb_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_architecture, ansible_architecture) }}"
     interloc_hub_url: ""
     interloc_register_token: ""
+    interloc_user: bot
+
+  handlers:
+    # try-restart: only bounce the daemon if it is already running.
+    - name: Restart interlocd
+      command: systemctl try-restart interlocd
 
   tasks:
     - name: Install ca-certificates
@@ -106,3 +112,11 @@
       file:
         path: "{{ interloc_deb_dir }}"
         state: absent
+
+    # Conffile: dpkg keeps this edit across upgrades.
+    - name: Run interlocd as {{ interloc_user }}
+      lineinfile:
+        path: /etc/interlocd/interlocd.env
+        regexp: '^\s*(export\s+)?INTERLOCD_USER='
+        line: "INTERLOCD_USER={{ interloc_user }}"
+      notify: Restart interlocd
